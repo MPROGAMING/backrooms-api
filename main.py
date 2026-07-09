@@ -82,54 +82,58 @@ class ErrorResponse(BaseModel):
 # ==============================================================================
 def generate_smart_slug_matrix(raw_input: str, is_intl: bool = False, lang: str = "") -> List[str]:
     """
-    The 'Brain' of the API. Generates every possible structural format a human
-    might intend when typing a level or entity name, completely eliminating 404s
-    caused by typos, missing dashes, or casing issues.
+    The Optimized 'Brain' of the API. Collapses multiple dashes, spaces, 
+    and handles uniform slug parsing to ensure 100% resolution accuracy.
     """
+    # 1. ניקוי ראשוני והסרת תווים לא חוקיים ב-URL
     base = unquote(raw_input).strip()
-    clean_base = re.sub(r'[^a-zA-Z0-9\s-]', '', base) # Strip weird characters
     
-    # Extract structural components
+    # 2. הפיכת רווחים למקפים, והפיכת אותיות לקטנות לצורך אחידות
+    normalized = base.replace(" ", "-").lower()
+    
+    # 3. חוק הברזל: הפיכת רצף של מקפים (כמו ---) למקף בודד אחד (-)
+    normalized = re.sub(r'-{2,}', '-', normalized)
+    
+    # 4. ניקוי שאריות של תווים מוזרים
+    clean_base = re.sub(r'[^a-zA-Z0-9-]', '', normalized)
+    
+    # חילוץ המספרים מהקלט (אם יש)
     numbers = ''.join(filter(str.isdigit, base))
     has_numbers = bool(numbers)
     
     variants = set()
     
-    # Standard format injections
-    variants.add(base)
-    variants.add(base.lower())
-    variants.add(base.replace(" ", "-").lower())
-    variants.add(base.replace(" ", "").lower())
-    variants.add(base.replace(" ", "_").lower())
-    variants.add(base.replace("-", "").lower())
-    variants.add(base.title().replace(" ", "-"))
+    # הזרקת הוריאציות הנקיות באמת למטריצה
+    variants.add(clean_base)                               # למשל: level-0
+    variants.add(clean_base.replace("-", ""))              # בלי מקף בכלל: level0
+    variants.add(clean_base.replace("-", "").capitalize()) # אות גדולה בלי מקף: Level0
     
-    # If it's a numbered level, brute-force all common wiki naming conventions
     if has_numbers:
         variants.add(f"level-{numbers}")
         variants.add(f"level{numbers}")
         variants.add(f"Level{numbers}")
         variants.add(f"Level-{numbers}")
-        variants.add(f"level_{numbers}")
-        variants.add(numbers) # Just the number as a slug (very common in free-writing)
+        variants.add(numbers)
         
-        # International Translation Matrix (Handling foreign language structural quirks)
-        if is_intl:
+        if is_intl and lang:
             lang_dict = {
                 "ru": f"uroven-{numbers}",
                 "es": f"nivel-{numbers}",
                 "fr": f"niveau-{numbers}",
-                "de": f"ebene-{numbers}",
-                "cn": f"level-{numbers}", # CN usually keeps english prefix but just in case
-                "pl": f"poziom-{numbers}"
+                "de": f"ebene-{numbers}"
             }
             if lang in lang_dict:
                 variants.add(lang_dict[lang])
                 variants.add(lang_dict[lang].replace("-", ""))
 
-    # Order by most likely to least likely for optimization
+    # הוספת גרסה באותיות גדולות למקרה של אותיות כמו 'N' או 'N-1'
+    variants.add(base.upper())
+    variants.add(base.lower())
+    if "-" in base:
+        variants.add(base.split("-")[0].lower() + "-" + "".join(base.split("-")[1:]).upper())
+
     ordered_variants = [v for v in variants if v]
-    logger.info(f"[SMART-MATRIX] Generated {len(ordered_variants)} permutations for '{raw_input}'")
+    logger.info(f"[SMART-MATRIX V2] Permutations compiled: {ordered_variants}")
     return ordered_variants
 
 # ==============================================================================

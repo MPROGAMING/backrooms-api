@@ -434,6 +434,12 @@ class ResilientHTTPClient:
             "User-Agent": random.choice(self.user_agents),
             "Accept": accept,
             "Accept-Language": "en-US,en;q=0.8",
+            # Some upstream wiki/CDN responses have advertised compressed
+            # payloads that httpx cannot decode reliably in Render.  Requesting
+            # identity encoding keeps the shared client deterministic and
+            # preserves the explicit SourceUnavailable taxonomy on real
+            # transport failures.
+            "Accept-Encoding": "identity",
             "Cache-Control": "no-cache",
         }
 

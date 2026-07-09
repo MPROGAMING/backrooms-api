@@ -59,8 +59,8 @@ from fastapi.responses import JSONResponse
 # =============================================================================
 
 APP_NAME = "BackroomsGPT Omni-Lore Gateway"
-APP_VERSION = "14.0.0"
-BUILD_NAME = "OMNI-LORE-V14"
+APP_VERSION = "20.0.0"
+BUILD_NAME = "ATLAS-OMNI-V20"
 DEFAULT_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "18"))
 DEFAULT_CONNECT_TIMEOUT_SECONDS = float(os.getenv("HTTP_CONNECT_TIMEOUT_SECONDS", "7"))
 DEFAULT_CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
@@ -363,9 +363,9 @@ class ResilientHTTPClient:
             lambda: asyncio.Semaphore(6)
         )
         self.user_agents = [
-            "BackroomsGPT-LoreGateway/13.0 (+https://backrooms-api.onrender.com)",
-            "M.E.G.-Archive-Resolver/13.0",
-            "Mozilla/5.0 (compatible; BackroomsGPT/13.0; lore-retrieval)",
+            "BackroomsGPT-LoreGateway/20.0 (+https://backrooms-api.onrender.com)",
+            "M.E.G.-Archive-Resolver/20.0",
+            "Mozilla/5.0 (compatible; BackroomsGPT/20.0; lore-retrieval)",
         ]
 
     def _headers(self, *, json_preferred: bool = False) -> dict:
@@ -3545,3 +3545,18 @@ async def bad_query_handler(request: Request, exc: BadSourceQuery):
 # =============================================================================
 # END OF BACKROOMSGPT OMNI-LORE GATEWAY
 # =============================================================================
+
+
+# =============================================================================
+# 25. ATLAS PLATFORM EXTENSIONS
+# =============================================================================
+from atlas.routes import install_atlas_platform
+
+atlas_platform = install_atlas_platform(
+    app=app,
+    registry=registry,
+    omni=omni,
+    adapter_for=adapter_for,
+    network=network,
+    utc_now_iso=utc_now_iso,
+)

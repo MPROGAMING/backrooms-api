@@ -44,14 +44,22 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, unquote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from security import (
+    BodySizeLimitMiddleware,
+    FixedWindowRateLimiter,
+    URLSafetyError,
+    normalize_allowed_http_url,
+    validate_discovery_target,
+)
 
 
 # =============================================================================
@@ -59,8 +67,8 @@ from fastapi.responses import JSONResponse
 # =============================================================================
 
 APP_NAME = "BackroomsGPT Omni-Lore Gateway"
-APP_VERSION = "20.0.0"
-BUILD_NAME = "ATLAS-OMNI-V20"
+APP_VERSION = "21.0.0"
+BUILD_NAME = "BACKROOMSGPT-FINAL-21"
 DEFAULT_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "18"))
 DEFAULT_CONNECT_TIMEOUT_SECONDS = float(os.getenv("HTTP_CONNECT_TIMEOUT_SECONDS", "7"))
 DEFAULT_CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
@@ -68,13 +76,26 @@ DEFAULT_NEGATIVE_CACHE_TTL_SECONDS = int(os.getenv("NEGATIVE_CACHE_TTL_SECONDS",
 DEFAULT_MAX_CACHE_ITEMS = int(os.getenv("MAX_CACHE_ITEMS", "2500"))
 DEFAULT_MAX_TEXT_CHARS = int(os.getenv("DEFAULT_MAX_TEXT_CHARS", "90000"))
 ABSOLUTE_MAX_TEXT_CHARS = int(os.getenv("ABSOLUTE_MAX_TEXT_CHARS", "250000"))
+# A Custom GPT Action needs concise, tool-safe responses.  Adapters may use a
+# larger bounded internal budget for indexing, but public endpoints default to
+# this smaller payload budget when a caller omits max_chars.
+ACTION_DEFAULT_MAX_TEXT_CHARS = int(os.getenv("ACTION_DEFAULT_MAX_TEXT_CHARS", "24000"))
+ACTION_ABSOLUTE_MAX_TEXT_CHARS = int(os.getenv("ACTION_ABSOLUTE_MAX_TEXT_CHARS", "60000"))
+MAX_UPSTREAM_RESPONSE_BYTES = int(os.getenv("MAX_UPSTREAM_RESPONSE_BYTES", "4_000_000"))
+MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", "262_144"))
 MAX_OMNI_CONCURRENCY = int(os.getenv("MAX_OMNI_CONCURRENCY", "10"))
 MAX_SOURCE_SEARCH_RESULTS = int(os.getenv("MAX_SOURCE_SEARCH_RESULTS", "12"))
 MAX_COMPARE_SOURCES = int(os.getenv("MAX_COMPARE_SOURCES", "12"))
 MAX_CDX_ROWS = int(os.getenv("MAX_CDX_ROWS", "500"))
+MAX_WIKIDOT_URL_CANDIDATES = int(os.getenv("MAX_WIKIDOT_URL_CANDIDATES", "24"))
+MAX_ARCHIVE_AVAILABILITY_CHECKS = int(os.getenv("MAX_ARCHIVE_AVAILABILITY_CHECKS", "12"))
 ARCHIVE_MIN_SIMILARITY = float(os.getenv("ARCHIVE_MIN_SIMILARITY", "0.78"))
 LIVE_SEARCH_MIN_SIMILARITY = float(os.getenv("LIVE_SEARCH_MIN_SIMILARITY", "0.40"))
 COMPARE_SECTION_EXCERPT_CHARS = int(os.getenv("COMPARE_SECTION_EXCERPT_CHARS", "900"))
+MAX_QUERY_CHARS = int(os.getenv("MAX_QUERY_CHARS", "500"))
+MAX_SOURCE_IDS_PER_REQUEST = int(os.getenv("MAX_SOURCE_IDS_PER_REQUEST", "12"))
+PUBLIC_OUTBOUND_REQUESTS_PER_MINUTE = int(os.getenv("PUBLIC_OUTBOUND_REQUESTS_PER_MINUTE", "30"))
+PUBLIC_OUTBOUND_GLOBAL_PER_MINUTE = int(os.getenv("PUBLIC_OUTBOUND_GLOBAL_PER_MINUTE", "240"))
 SERVICE_STARTED_AT = time.monotonic()
 
 logging.basicConfig(
@@ -101,7 +122,10 @@ def normalize_query(value: str) -> str:
     value = unquote((value or "").strip())
     value = value.replace("_", " ")
     value = re.sub(r"\s+", " ", value)
-    return value.strip()
+    value = value.strip()
+    if len(value) > MAX_QUERY_CHARS:
+        raise BadSourceQuery(f"Query must not exceed {MAX_QUERY_CHARS} characters.")
+    return value
 
 
 def normalize_title_key(value: str) -> str:
@@ -112,6 +136,11 @@ def normalize_title_key(value: str) -> str:
 
 def clamp_int(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, int(value)))
+
+
+def action_text_budget(value: int) -> int:
+    """Clamp public page-response text without constraining internal Atlas work."""
+    return clamp_int(value, 2_000, ACTION_ABSOLUTE_MAX_TEXT_CHARS)
 
 
 # =============================================================================
@@ -151,6 +180,7 @@ def error_response(
     diagnostics: Optional[str] = None,
     retryable: bool = False,
     details: Optional[dict] = None,
+    headers: Optional[Mapping[str, str]] = None,
 ) -> JSONResponse:
     payload: Dict[str, Any] = {
         "ok": False,
@@ -171,7 +201,7 @@ def error_response(
         payload["error"]["diagnostics"] = diagnostics[:2000]
     if details:
         payload["error"]["details"] = details
-    return JSONResponse(status_code=status_code, content=payload)
+    return JSONResponse(status_code=status_code, content=payload, headers=dict(headers or {}))
 
 
 # =============================================================================
@@ -332,6 +362,21 @@ class FetchDiagnostic:
     message: Optional[str] = None
 
 
+@dataclass
+class LimitedFetchResponse:
+    """A bounded response used only for untrusted Source Discovery seeds."""
+
+    url: str
+    status_code: int
+    headers: Mapping[str, str]
+    content: bytes
+    diagnostics: List[FetchDiagnostic]
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8", errors="replace")
+
+
 class ResilientHTTPClient:
     """
     Shared async HTTP client with:
@@ -355,7 +400,10 @@ class ResilientHTTPClient:
         )
         self.client = httpx.AsyncClient(
             timeout=timeout,
-            follow_redirects=True,
+            # Redirects are followed manually below so each destination goes
+            # through the same allowlist/DNS validation as the initial URL.
+            follow_redirects=False,
+            trust_env=False,
             limits=limits,
         )
         self.breakers: Dict[str, CircuitBreaker] = defaultdict(CircuitBreaker)
@@ -363,10 +411,20 @@ class ResilientHTTPClient:
             lambda: asyncio.Semaphore(6)
         )
         self.user_agents = [
-            "BackroomsGPT-LoreGateway/20.0 (+https://backrooms-api.onrender.com)",
-            "M.E.G.-Archive-Resolver/20.0",
-            "Mozilla/5.0 (compatible; BackroomsGPT/20.0; lore-retrieval)",
+            "BackroomsGPT-LoreGateway/21.0 (+https://backrooms-api.onrender.com/privacy)",
+            "M.E.G.-Archive-Resolver/21.0",
+            "Mozilla/5.0 (compatible; BackroomsGPT/21.0; lore-retrieval)",
         ]
+        self._target_validator: Optional[Callable[[str], Awaitable[str]]] = None
+
+    def set_target_validator(self, validator: Callable[[str], Awaitable[str]]) -> None:
+        """Install the central allowlist + DNS validator after registry setup."""
+        self._target_validator = validator
+
+    async def _validate_target(self, url: str) -> str:
+        if self._target_validator is None:
+            return url
+        return await self._target_validator(url)
 
     def _headers(self, *, json_preferred: bool = False) -> dict:
         accept = "application/json,text/plain;q=0.9,*/*;q=0.7" if json_preferred else (
@@ -389,30 +447,91 @@ class ResilientHTTPClient:
         json_preferred: bool = False,
         extra_headers: Optional[Mapping[str, str]] = None,
         allow_404: bool = True,
+        max_response_bytes: int = MAX_UPSTREAM_RESPONSE_BYTES,
+        max_redirects: int = 3,
     ) -> Tuple[Optional[httpx.Response], List[FetchDiagnostic]]:
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-        breaker = self.breakers[host]
-
-        if not breaker.can_request():
-            raise SourceUnavailable(f"Circuit breaker open for upstream host {host}")
-
         headers = self._headers(json_preferred=json_preferred)
         if extra_headers:
             headers.update(extra_headers)
 
         diagnostics: List[FetchDiagnostic] = []
-        async with self.host_semaphores[host]:
-            for attempt in range(retries + 1):
-                started = time.monotonic()
-                try:
-                    response = await self.client.request(
-                        method,
-                        url,
-                        params=params,
-                        headers=headers,
-                    )
-                    elapsed_ms = int((time.monotonic() - started) * 1000)
+        initial_url = await self._validate_target(url)
+
+        for attempt in range(retries + 1):
+            current_url = initial_url
+            current_params = params
+            redirects = 0
+            try:
+                while True:
+                    host = urlparse(current_url).hostname or ""
+                    breaker = self.breakers[host]
+                    if not breaker.can_request():
+                        raise SourceUnavailable(f"Circuit breaker open for upstream host {host}")
+
+                    started = time.monotonic()
+                    async with self.host_semaphores[host]:
+                        async with self.client.stream(
+                            method,
+                            current_url,
+                            params=current_params,
+                            headers=headers,
+                            follow_redirects=False,
+                        ) as upstream:
+                            elapsed_ms = int((time.monotonic() - started) * 1000)
+                            status = upstream.status_code
+                            response_url = str(upstream.url)
+
+                            if 300 <= status < 400:
+                                location = upstream.headers.get("location")
+                                if not location:
+                                    raise SourceUnavailable(
+                                        f"Upstream {host} returned a redirect without a Location header"
+                                    )
+                                if redirects >= max_redirects:
+                                    raise SourceUnavailable(
+                                        f"Upstream redirect limit exceeded for {url}"
+                                    )
+                                next_url = urljoin(response_url, location)
+                                current_url = await self._validate_target(next_url)
+                                current_params = None
+                                redirects += 1
+                                diagnostics.append(
+                                    FetchDiagnostic(
+                                        url=response_url,
+                                        ok=True,
+                                        status_code=status,
+                                        elapsed_ms=elapsed_ms,
+                                        error_type="redirect",
+                                        message="Validated redirect followed manually",
+                                    )
+                                )
+                                continue
+
+                            declared_length = upstream.headers.get("content-length")
+                            if declared_length:
+                                try:
+                                    if int(declared_length) > max_response_bytes:
+                                        raise SourceUnavailable(
+                                            f"Upstream response exceeded {max_response_bytes} bytes"
+                                        )
+                                except ValueError:
+                                    pass
+
+                            chunks: List[bytes] = []
+                            total = 0
+                            async for chunk in upstream.aiter_bytes():
+                                total += len(chunk)
+                                if total > max_response_bytes:
+                                    raise SourceUnavailable(
+                                        f"Upstream response exceeded {max_response_bytes} bytes"
+                                    )
+                                chunks.append(chunk)
+                            response = httpx.Response(
+                                status,
+                                headers=upstream.headers,
+                                content=b"".join(chunks),
+                                request=upstream.request,
+                            )
 
                     if response.status_code == 404 and allow_404:
                         diagnostics.append(
@@ -428,7 +547,7 @@ class ResilientHTTPClient:
                         breaker.record_success()
                         return response, diagnostics
 
-                    if 200 <= response.status_code < 400:
+                    if 200 <= response.status_code < 300:
                         diagnostics.append(
                             FetchDiagnostic(
                                 url=str(response.url),
@@ -450,59 +569,36 @@ class ResilientHTTPClient:
                             message=f"HTTP {response.status_code}",
                         )
                     )
-
                     retryable = response.status_code in {408, 425, 429, 500, 502, 503, 504}
                     if not retryable or attempt >= retries:
                         breaker.record_failure()
                         raise SourceUnavailable(
                             f"Upstream {host} returned HTTP {response.status_code}"
                         )
-
-                except SourceUnavailable:
-                    raise
-                except (
-                    httpx.ConnectError,
-                    httpx.ConnectTimeout,
-                    httpx.ReadTimeout,
-                    httpx.RemoteProtocolError,
-                    httpx.TooManyRedirects,
-                ) as exc:
-                    elapsed_ms = int((time.monotonic() - started) * 1000)
-                    diagnostics.append(
-                        FetchDiagnostic(
-                            url=url,
-                            ok=False,
-                            status_code=None,
-                            elapsed_ms=elapsed_ms,
-                            error_type=type(exc).__name__,
-                            message=str(exc)[:500],
-                        )
+                    break
+            except (SourceUnavailable, UnsafeTarget):
+                raise
+            except httpx.HTTPError as exc:
+                host = urlparse(current_url).hostname or "unknown"
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                diagnostics.append(
+                    FetchDiagnostic(
+                        url=current_url,
+                        ok=False,
+                        status_code=None,
+                        elapsed_ms=elapsed_ms,
+                        error_type=type(exc).__name__,
+                        message=str(exc)[:500],
                     )
-                    if attempt >= retries:
-                        breaker.record_failure()
-                        raise SourceUnavailable(
-                            f"Unable to reach upstream host {host}: {type(exc).__name__}"
-                        ) from exc
-                except httpx.HTTPError as exc:
-                    elapsed_ms = int((time.monotonic() - started) * 1000)
-                    diagnostics.append(
-                        FetchDiagnostic(
-                            url=url,
-                            ok=False,
-                            status_code=None,
-                            elapsed_ms=elapsed_ms,
-                            error_type=type(exc).__name__,
-                            message=str(exc)[:500],
-                        )
-                    )
-                    if attempt >= retries:
-                        breaker.record_failure()
-                        raise SourceUnavailable(
-                            f"HTTP client failure for {host}: {type(exc).__name__}"
-                        ) from exc
+                )
+                if attempt >= retries:
+                    self.breakers[host].record_failure()
+                    raise SourceUnavailable(
+                        f"Unable to reach upstream host {host}: {type(exc).__name__}"
+                    ) from exc
 
-                delay = min(4.0, (0.35 * (2 ** attempt)) + random.uniform(0.0, 0.25))
-                await asyncio.sleep(delay)
+            delay = min(4.0, (0.35 * (2 ** attempt)) + random.uniform(0.0, 0.25))
+            await asyncio.sleep(delay)
 
         raise SourceUnavailable(f"Exhausted retries for {url}")
 
@@ -523,6 +619,89 @@ class ResilientHTTPClient:
             json_preferred=json_preferred,
             allow_404=allow_404,
         )
+
+    async def get_limited(
+        self,
+        url: str,
+        *,
+        max_bytes: int,
+        timeout_seconds: float = 8.0,
+    ) -> LimitedFetchResponse:
+        """Fetch a small untrusted HTML document without following redirects.
+
+        Source Discovery validates each redirect destination itself.  Streaming
+        keeps an oversized response from being buffered in memory.
+        """
+        url = await self._validate_target(url)
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        breaker = self.breakers[host]
+        if not breaker.can_request():
+            raise SourceUnavailable(f"Circuit breaker open for upstream host {host}")
+
+        timeout = httpx.Timeout(
+            timeout_seconds,
+            connect=min(DEFAULT_CONNECT_TIMEOUT_SECONDS, timeout_seconds),
+        )
+        started = time.monotonic()
+        try:
+            async with self.host_semaphores[host]:
+                async with self.client.stream(
+                    "GET",
+                    url,
+                    headers=self._headers(),
+                    follow_redirects=False,
+                    timeout=timeout,
+                ) as response:
+                    elapsed_ms = int((time.monotonic() - started) * 1000)
+                    diagnostic = FetchDiagnostic(
+                        url=str(response.url),
+                        ok=200 <= response.status_code < 400,
+                        status_code=response.status_code,
+                        elapsed_ms=elapsed_ms,
+                        error_type=None if 200 <= response.status_code < 400 else "upstream_http",
+                        message=None if 200 <= response.status_code < 400 else f"HTTP {response.status_code}",
+                    )
+                    if 300 <= response.status_code < 400:
+                        breaker.record_success()
+                        return LimitedFetchResponse(
+                            url=str(response.url),
+                            status_code=response.status_code,
+                            headers=dict(response.headers),
+                            content=b"",
+                            diagnostics=[diagnostic],
+                        )
+
+                    declared_length = response.headers.get("content-length")
+                    if declared_length:
+                        try:
+                            if int(declared_length) > max_bytes:
+                                raise SourceUnavailable("Discovery response exceeded the configured size limit.")
+                        except ValueError:
+                            pass
+
+                    chunks: List[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise SourceUnavailable("Discovery response exceeded the configured size limit.")
+                        chunks.append(chunk)
+                    breaker.record_success()
+                    return LimitedFetchResponse(
+                        url=str(response.url),
+                        status_code=response.status_code,
+                        headers=dict(response.headers),
+                        content=b"".join(chunks),
+                        diagnostics=[diagnostic],
+                    )
+        except SourceUnavailable:
+            raise
+        except httpx.HTTPError as exc:
+            breaker.record_failure()
+            raise SourceUnavailable(
+                f"Unable to reach upstream host {host}: {type(exc).__name__}"
+            ) from exc
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -649,7 +828,6 @@ BUILTIN_SOURCES: List[SourceConfig] = [
         priority=20,
         base_urls=(
             "https://liminal-archives.wikidot.com",
-            "http://liminal-archives.wikidot.com",
             "https://liminalarchives.wikidot.com",
         ),
         aliases=("liminal", "la", "liminalarchives"),
@@ -735,6 +913,7 @@ EXPLICIT_ALLOWED_HOSTS: Set[str] = {
     "kane-pixels-backrooms.fandom.com",
     "web.archive.org",
     "archive.org",
+    "commons.wikimedia.org",
 }
 
 for _source in BUILTIN_SOURCES:
@@ -747,27 +926,63 @@ for _source in BUILTIN_SOURCES:
 
 
 def validate_public_http_url(url: str) -> str:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise UnsafeTarget("Only http and https URLs are supported.")
-    host = (parsed.hostname or "").casefold()
-    if not host:
-        raise UnsafeTarget("Target URL has no hostname.")
-
-    # Literal private/local IPs are never allowed.
     try:
-        ip = ipaddress.ip_address(host)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            raise UnsafeTarget("Private, loopback, link-local, and reserved addresses are not allowed.")
-    except ValueError:
-        pass
-
-    allowed = host in EXPLICIT_ALLOWED_HOSTS or any(host.endswith(suffix) for suffix in ALLOWED_DYNAMIC_SUFFIXES)
-    if not allowed:
-        raise UnsafeTarget(
-            f"Host '{host}' is not in the supported Backrooms wiki host allowlist."
+        normalized = normalize_allowed_http_url(
+            url,
+            explicit_hosts=EXPLICIT_ALLOWED_HOSTS,
+            allowed_suffixes=ALLOWED_DYNAMIC_SUFFIXES,
         )
-    return url
+        if urlparse(normalized).scheme != "https":
+            raise URLSafetyError("Only HTTPS targets are supported by this service.")
+        return normalized
+    except URLSafetyError as exc:
+        raise UnsafeTarget(str(exc)) from exc
+
+
+async def validate_discovery_seed_url(url: str) -> str:
+    """Validate Source Discovery seeds before every initial/redirect fetch.
+
+    The feature is intentionally constrained to the same public Fandom and
+    Wikidot platform suffixes used by dynamic retrieval.  It preflights all DNS
+    answers, but does not claim generic DNS-rebinding protection because Python's
+    HTTP client is not pinned to a resolved address.  Restricting the feature to
+    those platform-owned suffixes is the security boundary.
+    """
+    try:
+        normalized = await validate_discovery_target(
+            url,
+            explicit_hosts=(),
+            allowed_suffixes=ALLOWED_DYNAMIC_SUFFIXES,
+        )
+        if urlparse(normalized).scheme != "https":
+            raise URLSafetyError("Source Discovery only accepts HTTPS seed URLs.")
+        return normalized
+    except URLSafetyError as exc:
+        raise UnsafeTarget(str(exc)) from exc
+
+
+async def validate_server_fetch_target(url: str) -> str:
+    """Central URL policy for every server-side network request.
+
+    The HTTP client calls this before its initial request and again before every
+    redirect. It combines the established source allowlist with DNS validation.
+    Connections are intentionally not claimed to be DNS-pinned; the defensible
+    boundary is restricted platform/configured hosts plus preflight validation.
+    """
+    try:
+        normalized = await validate_discovery_target(
+            url,
+            explicit_hosts=EXPLICIT_ALLOWED_HOSTS,
+            allowed_suffixes=ALLOWED_DYNAMIC_SUFFIXES,
+        )
+        if urlparse(normalized).scheme != "https":
+            raise URLSafetyError("Only HTTPS upstream targets are supported.")
+        return normalized
+    except URLSafetyError as exc:
+        raise UnsafeTarget(str(exc)) from exc
+
+
+network.set_target_validator(validate_server_fetch_target)
 
 
 def validate_dynamic_site_hostname(site: str, expected_suffix: str) -> str:
@@ -909,7 +1124,12 @@ def sanitize_html_document(
 
     content = _best_content_container(soup, preferred_container_id)
 
-    # Preserve links and images before removing navigation/noise.
+    # Remove page chrome before extracting links/sections. Navigation links are
+    # not article relationships and otherwise pollute the Atlas graph.
+    for selector in NOISE_SELECTORS:
+        for node in content.select(selector):
+            node.decompose()
+
     links: List[dict] = []
     seen_links: Set[Tuple[str, str]] = set()
     for anchor in content.find_all("a", href=True):
@@ -955,10 +1175,6 @@ def sanitize_html_document(
         text = compact_ws(node.get_text(" ", strip=True))
         if text:
             section_buffers[current_heading].append(text)
-
-    for selector in NOISE_SELECTORS:
-        for node in content.select(selector):
-            node.decompose()
 
     clean_text = content.get_text(separator="\n", strip=True)
     clean_text = html.unescape(clean_text)
@@ -1303,6 +1519,49 @@ def archive_candidate_match_score(
     return round(score, 4)
 
 
+def canonical_identity_keys(title: str, url: str = "") -> Set[str]:
+    """Return exact normalized page identifiers from a title and URL path.
+
+    Display titles on Wikidot can be generic (for example, ``Liminal Archives``)
+    while the URL path is exact. Conversely, token overlap is not identity: a
+    page called ``Baby Food Review`` is not the ``Baby Food`` article.
+    """
+    values = [title]
+    parsed = urlparse(url)
+    path = unquote(parsed.path or "").strip("/")
+    if path:
+        values.extend([path, path.rsplit("/", 1)[-1]])
+    return {normalize_title_key(value) for value in values if normalize_title_key(value)}
+
+
+def live_candidate_is_acceptable(query: str, candidate_title: str, candidate_url: str = "") -> bool:
+    """Require exact canonical identity before a direct fetch substitutes a title.
+
+    Search is intentionally allowed to find approximate ideas. Fetching a page on
+    behalf of an exact user query is not: it must resolve to the same normalized
+    title or URL slug. Level numbers are additionally identity-critical.
+    """
+    query_key = normalize_title_key(query)
+    if not query_key:
+        return False
+    keys = canonical_identity_keys(candidate_title, candidate_url)
+    if query_key in keys:
+        return True
+
+    query_level = extract_level_identifier(query)
+    candidate_levels = {
+        level
+        for level in (
+            extract_level_identifier(candidate_title),
+            extract_level_identifier(unquote(urlparse(candidate_url).path)),
+        )
+        if level is not None
+    }
+    if query_level is not None:
+        return candidate_levels == {query_level} and query_key in keys
+    return False
+
+
 def archive_candidate_is_acceptable(
     query: str,
     candidate_title: str,
@@ -1310,7 +1569,13 @@ def archive_candidate_is_acceptable(
     *,
     threshold: float = ARCHIVE_MIN_SIMILARITY,
 ) -> bool:
-    return archive_candidate_match_score(query, candidate_title, original_url) >= threshold
+    # Archive title/path identity is stricter than ranking. Archive search may
+    # use fuzzy scoring to order candidates, but only an exact canonical key may
+    # be promoted to a page response.
+    return (
+        live_candidate_is_acceptable(query, candidate_title, original_url)
+        and archive_candidate_match_score(query, candidate_title, original_url) >= threshold
+    )
 
 
 # =============================================================================
@@ -1355,10 +1620,32 @@ class PagePayload:
     truncated: bool = False
     upstream_diagnostics: List[dict] = field(default_factory=list)
 
-    def to_dict(self, *, include_text: bool = True) -> dict:
+    def to_dict(self, *, include_text: bool = True, action_safe: bool = False) -> dict:
         data = asdict(self)
         if not include_text:
             data.pop("text", None)
+        if action_safe:
+            # Keep the high-value page content, but cap auxiliary structures so
+            # a single Action response cannot grow with page navigation chrome.
+            data["headings"] = data.get("headings", [])[:40]
+            data["links"] = data.get("links", [])[:100]
+            data["image_urls"] = data.get("image_urls", [])[:30]
+            data["upstream_diagnostics"] = data.get("upstream_diagnostics", [])[:8]
+            analysis = dict(data.get("analysis") or {})
+            sections = dict(analysis.get("section_extracts") or {})
+            analysis["section_extracts"] = {
+                key: compact_ws(str(value or ""))[:2_000]
+                for key, value in sections.items()
+            }
+            signals = dict(analysis.get("named_signals") or {})
+            analysis["named_signals"] = {
+                key: list(value or [])[:20] for key, value in signals.items()
+            }
+            hazard = dict(analysis.get("heuristic_hazard_signal") or {})
+            if "evidence" in hazard:
+                hazard["evidence"] = list(hazard["evidence"] or [])[:8]
+            analysis["heuristic_hazard_signal"] = hazard
+            data["analysis"] = analysis
         data["provenance"] = {
             "source_id": self.source_id,
             "source_name": self.source_name,
@@ -1369,6 +1656,138 @@ class PagePayload:
             "archive_timestamp": self.archive_timestamp,
         }
         return data
+
+
+def action_page_payload(page: PagePayload) -> dict:
+    """Serialize a page for a Custom GPT Action with a hard response budget.
+
+    Upstream HTML is bounded before parsing, but parsed auxiliary fields can
+    still expand independently (for example a page with many long link labels).
+    Keep only the documented, high-value response shape and then apply a second
+    compact fallback if needed.  This prevents an Action response from becoming
+    unbounded through navigation chrome or unusual source markup.
+    """
+    data = page.to_dict(action_safe=True)
+    for field_name, limit in {
+        "source_id": 120,
+        "source_name": 240,
+        "canon": 240,
+        "title": 500,
+        "url": 2_048,
+        "language": 32,
+        "requested_query": 500,
+        "resolved_via": 120,
+        "retrieved_at": 80,
+        "archive_timestamp": 80,
+    }.items():
+        data[field_name] = compact_ws(str(data.get(field_name) or ""))[:limit]
+    data["text"] = str(data.get("text") or "")[:ACTION_ABSOLUTE_MAX_TEXT_CHARS]
+    data["headings"] = [
+        compact_ws(str(heading or ""))[:500]
+        for heading in data.get("headings", [])[:40]
+    ]
+    data["links"] = [
+        {
+            "title": compact_ws(str(link.get("title") or ""))[:500],
+            "url": str(link.get("url") or "")[:1_024],
+        }
+        for link in data.get("links", [])[:100]
+        if isinstance(link, Mapping)
+    ]
+    data["image_urls"] = [str(url)[:1_024] for url in data.get("image_urls", [])[:30]]
+    raw_analysis = dict(data.get("analysis") or {})
+    raw_signals = dict(raw_analysis.get("named_signals") or {})
+    named_signals = {}
+    for key, values in list(raw_signals.items())[:12]:
+        if not isinstance(values, (list, tuple, set)):
+            values = [values]
+        named_signals[compact_ws(str(key or ""))[:80]] = [
+            compact_ws(str(value or ""))[:300] for value in list(values)[:20]
+        ]
+    raw_hazard = dict(raw_analysis.get("heuristic_hazard_signal") or {})
+    evidence = []
+    for item in list(raw_hazard.get("evidence") or [])[:8]:
+        if not isinstance(item, Mapping):
+            continue
+        evidence.append(
+            {
+                "term": compact_ws(str(item.get("term") or ""))[:120],
+                "count": item.get("count") if isinstance(item.get("count"), (int, float)) else None,
+                "weight": item.get("weight") if isinstance(item.get("weight"), (int, float)) else None,
+            }
+        )
+    section_extracts = {}
+    for key, value in list(dict(raw_analysis.get("section_extracts") or {}).items())[:8]:
+        section_extracts[compact_ws(str(key or ""))[:80]] = compact_ws(str(value or ""))[:1_000]
+    detected_sections = {
+        compact_ws(str(key or ""))[:80]: bool(value)
+        for key, value in list(dict(raw_analysis.get("detected_sections") or {}).items())[:12]
+    }
+    document_stats = {
+        compact_ws(str(key or ""))[:80]: value
+        for key, value in list(dict(raw_analysis.get("document_stats") or {}).items())[:12]
+        if isinstance(value, (bool, int, float))
+    }
+    data["analysis"] = {
+        "summary": compact_ws(str(raw_analysis.get("summary") or ""))[:3_000],
+        "heuristic_hazard_signal": {
+            "label": compact_ws(str(raw_hazard.get("label") or ""))[:120],
+            "score": raw_hazard.get("score") if isinstance(raw_hazard.get("score"), (int, float)) else None,
+            "method": compact_ws(str(raw_hazard.get("method") or ""))[:500],
+            "evidence": evidence,
+        },
+        "named_signals": named_signals,
+        "detected_sections": detected_sections,
+        "section_extracts": section_extracts,
+        "document_stats": document_stats,
+    }
+    data["upstream_diagnostics"] = [
+        {
+            "url": str(item.get("url") or "")[:1_024],
+            "ok": bool(item.get("ok")),
+            "status_code": item.get("status_code") if isinstance(item.get("status_code"), int) else None,
+            "elapsed_ms": item.get("elapsed_ms") if isinstance(item.get("elapsed_ms"), int) else None,
+            "error_type": compact_ws(str(item.get("error_type") or ""))[:120],
+            "message": compact_ws(str(item.get("message") or ""))[:500],
+        }
+        for item in data.get("upstream_diagnostics", [])[:8]
+        if isinstance(item, Mapping)
+    ]
+    data["provenance"] = {
+        "source_id": data["source_id"],
+        "source_name": data["source_name"],
+        "canon": data["canon"],
+        "url": data["url"],
+        "retrieved_at": data["retrieved_at"],
+        "archived": bool(data.get("archived")),
+        "archive_timestamp": data["archive_timestamp"] or None,
+    }
+    encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > 64_000:
+        data["text"] = data["text"][:12_000]
+        data["headings"] = data["headings"][:10]
+        data["links"] = [
+            {"title": link["title"][:160], "url": link["url"][:384]}
+            for link in data["links"][:12]
+        ]
+        data["image_urls"] = [url[:384] for url in data["image_urls"][:8]]
+        data["analysis"] = {
+            "summary": data["analysis"]["summary"][:1_000],
+            "heuristic_hazard_signal": data["analysis"]["heuristic_hazard_signal"],
+            "named_signals": {
+                key: values[:5]
+                for key, values in list(data["analysis"]["named_signals"].items())[:6]
+            },
+            "detected_sections": data["analysis"]["detected_sections"],
+            "section_extracts": {
+                key: value[:300]
+                for key, value in list(data["analysis"]["section_extracts"].items())[:4]
+            },
+            "document_stats": data["analysis"]["document_stats"],
+        }
+        data["upstream_diagnostics"] = data["upstream_diagnostics"][:2]
+        data["action_payload_truncated"] = True
+    return data
 
 
 # =============================================================================
@@ -1390,6 +1809,20 @@ class BaseAdapter:
         allow_archive_fallback: bool = True,
     ) -> PagePayload:
         raise NotImplementedError
+
+    async def fetch_hit(
+        self,
+        hit: SearchHit,
+        *,
+        max_chars: int = DEFAULT_MAX_TEXT_CHARS,
+        allow_archive_fallback: bool = True,
+    ) -> PagePayload:
+        """Fetch a previously returned search hit using its canonical locator."""
+        return await self.fetch_page(
+            hit.title,
+            max_chars=max_chars,
+            allow_archive_fallback=allow_archive_fallback,
+        )
 
     async def recent(self, limit: int = 10) -> List[SearchHit]:
         raise BadSourceQuery(f"Source {self.source.id} does not support recent changes.")
@@ -1521,6 +1954,10 @@ class MediaWikiAdapter(BaseAdapter):
             if self.source.page_url_template
             else self.source.api_url
         )
+        if not live_candidate_is_acceptable(requested_query, resolved_title, page_url):
+            raise PageNotFound(
+                f"MediaWiki resolved '{requested_query}' to a different page identity."
+            )
         doc = sanitize_html_document(
             html_text,
             page_url=page_url,
@@ -1560,6 +1997,7 @@ class MediaWikiAdapter(BaseAdapter):
         page = normalize_query(page)
         if not page:
             raise BadSourceQuery("Page title cannot be empty.")
+        max_chars = clamp_int(max_chars, 2000, ABSOLUTE_MAX_TEXT_CHARS)
 
         cache_key = f"page:{self.source.id}:{page.casefold()}:{max_chars}"
         cached = await cache.get(cache_key)
@@ -1588,7 +2026,17 @@ class MediaWikiAdapter(BaseAdapter):
             await cache.set(cache_key, {"_negative": True, "message": message}, negative=True)
             raise PageNotFound(message)
 
-        best = hits[0]
+        candidates = [
+            hit
+            for hit in hits
+            if live_candidate_is_acceptable(page, hit.title, hit.url)
+        ]
+        if not candidates:
+            message = f"No exact page identity matching '{page}' in {self.source.name}"
+            await cache.set(cache_key, {"_negative": True, "message": message}, negative=True)
+            raise PageNotFound(message)
+
+        best = candidates[0]
         payload = await self._fetch_exact_title(
             best.title,
             max_chars=max_chars,
@@ -1597,6 +2045,24 @@ class MediaWikiAdapter(BaseAdapter):
         )
         await cache.set(cache_key, asdict(payload))
         return payload
+
+    async def fetch_hit(
+        self,
+        hit: SearchHit,
+        *,
+        max_chars: int = DEFAULT_MAX_TEXT_CHARS,
+        allow_archive_fallback: bool = True,
+    ) -> PagePayload:
+        if hit.source_id != self.source.id:
+            raise BadSourceQuery("Search hit belongs to a different source.")
+        if not live_candidate_is_acceptable(hit.title, hit.title, hit.url):
+            raise PageNotFound("Search result did not contain a safe canonical page identity.")
+        return await self._fetch_exact_title(
+            hit.title,
+            max_chars=clamp_int(max_chars, 2000, ABSOLUTE_MAX_TEXT_CHARS),
+            requested_query=hit.title,
+            resolved_via="mediawiki-search-hit",
+        )
 
     async def recent(self, limit: int = 10) -> List[SearchHit]:
         limit = clamp_int(limit, 1, 50)
@@ -1849,74 +2315,57 @@ class WikidotAdapter(BaseAdapter):
         all_diagnostics: List[dict] = []
         reachable = False
 
-        # Use bounded concurrency and preserve exception information.
-        semaphore = asyncio.Semaphore(8)
-
-        async def fetch_one(url: str):
-            async with semaphore:
-                try:
-                    response, diagnostics = await network.get(
-                        url,
-                        retries=1,
-                        allow_404=True,
-                    )
-                    return url, response, diagnostics, None
-                except Exception as exc:
-                    return url, None, [], exc
-
-        tasks = [asyncio.create_task(fetch_one(url)) for url in urls]
-        try:
-            for completed in asyncio.as_completed(tasks):
-                url, response, diagnostics, exc = await completed
+        # Preserve slug/base priority. Racing every candidate allowed the fastest
+        # page to win, even when it was not the intended canonical slug, and
+        # amplified one public request into dozens of outbound requests.
+        for url in urls[:MAX_WIKIDOT_URL_CANDIDATES]:
+            try:
+                response, diagnostics = await network.get(
+                    url,
+                    retries=1,
+                    allow_404=True,
+                )
                 all_diagnostics.extend(asdict(d) for d in diagnostics)
-                if exc is not None:
-                    all_diagnostics.append(
-                        {
-                            "url": url,
-                            "ok": False,
-                            "status_code": None,
-                            "elapsed_ms": 0,
-                            "error_type": type(exc).__name__,
-                            "message": str(exc)[:500],
-                        }
-                    )
-                    continue
-                if response is None:
-                    continue
-                if response.status_code == 404:
-                    reachable = True
-                    continue
+            except Exception as exc:
+                all_diagnostics.append(
+                    {
+                        "url": url,
+                        "ok": False,
+                        "status_code": None,
+                        "elapsed_ms": 0,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:500],
+                    }
+                )
+                continue
+            if response is None:
+                continue
+            if response.status_code == 404:
                 reachable = True
-                if 200 <= response.status_code < 400:
-                    # Check for soft-404 body markers.
-                    doc = sanitize_html_document(
-                        response.text,
-                        page_url=str(response.url),
-                        preferred_container_id="page-content",
-                        max_chars=5000,
-                    )
-                    if doc.missing_page_signal:
-                        continue
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
-                    return response, str(response.url), all_diagnostics, reachable
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
+                continue
+            reachable = True
+            if 200 <= response.status_code < 300:
+                doc = sanitize_html_document(
+                    response.text,
+                    page_url=str(response.url),
+                    preferred_container_id="page-content",
+                    max_chars=5000,
+                )
+                if doc.missing_page_signal:
+                    continue
+                return response, str(response.url), all_diagnostics, reachable
 
         return None, None, all_diagnostics, reachable
 
     def _page_urls(self, page: str) -> List[str]:
         slugs = generate_slug_candidates(page, language=self.source.language)
         urls: List[str] = []
-        for base in self.source.base_urls:
-            for slug in slugs:
+        for slug in slugs:
+            for base in self.source.base_urls:
                 url = f"{base.rstrip('/')}/{quote(slug, safe=':_-./')}"
                 if url not in urls:
                     urls.append(url)
-        return urls[:160]
+        return urls[:MAX_WIKIDOT_URL_CANDIDATES]
 
     async def _live_fetch(
         self,
@@ -1946,6 +2395,10 @@ class WikidotAdapter(BaseAdapter):
         )
         if not doc.text or doc.missing_page_signal:
             raise PageNotFound(f"Page '{page}' resolved to a soft 404.")
+        if not live_candidate_is_acceptable(page, doc.title or page, successful_url):
+            raise PageNotFound(
+                f"Live Wikidot result did not safely match requested page '{page}'."
+            )
 
         return PagePayload(
             source_id=self.source.id,
@@ -2112,7 +2565,7 @@ class WikidotAdapter(BaseAdapter):
             )
 
         # 2) Check exact candidate URLs via availability API.
-        for url in self._page_urls(page)[:60]:
+        for url in self._page_urls(page)[:MAX_ARCHIVE_AVAILABILITY_CHECKS]:
             try:
                 snapshot = await wayback.find_snapshot(url)
             except Exception:
@@ -2161,8 +2614,13 @@ class WikidotAdapter(BaseAdapter):
             try:
                 hits = await self.search(page, limit=8)
                 live_hits = [hit for hit in hits if not hit.archived]
-                if live_hits:
-                    best = live_hits[0]
+                candidates = [
+                    hit
+                    for hit in live_hits
+                    if live_candidate_is_acceptable(page, hit.title, hit.url)
+                ]
+                if candidates:
+                    best = candidates[0]
                     path = unquote(urlparse(best.url).path.strip("/"))
                     payload = await self._live_fetch(path or best.title, max_chars=max_chars)
                     payload.requested_query = page
@@ -2189,6 +2647,39 @@ class WikidotAdapter(BaseAdapter):
         if isinstance(live_error, SourceUnavailable):
             raise live_error
         raise PageNotFound(message)
+
+    async def fetch_hit(
+        self,
+        hit: SearchHit,
+        *,
+        max_chars: int = DEFAULT_MAX_TEXT_CHARS,
+        allow_archive_fallback: bool = True,
+    ) -> PagePayload:
+        if hit.source_id != self.source.id:
+            raise BadSourceQuery("Search hit belongs to a different source.")
+        bounded_chars = clamp_int(max_chars, 2000, ABSOLUTE_MAX_TEXT_CHARS)
+        if hit.archived:
+            if not allow_archive_fallback:
+                raise PageNotFound(
+                    "A matching historical archive candidate exists, but archive fallback is disabled."
+                )
+            timestamp_match = re.search(r"/web/(\d+)", hit.url)
+            payload = await wayback.fetch_archived_url(
+                hit.url,
+                source=self.source,
+                requested_query=hit.title,
+                max_chars=bounded_chars,
+                resolved_via="wayback-search-hit",
+                archive_timestamp=timestamp_match.group(1) if timestamp_match else None,
+            )
+        else:
+            locator = unquote(urlparse(hit.url).path.strip("/")) or hit.title
+            payload = await self._live_fetch(locator, max_chars=bounded_chars)
+            payload.requested_query = hit.title
+            payload.resolved_via = "wikidot-search-hit"
+        if not live_candidate_is_acceptable(hit.title, payload.title, payload.url):
+            raise PageNotFound("Search hit did not resolve to its canonical page identity.")
+        return payload
 
     async def recent(self, limit: int = 10) -> List[SearchHit]:
         limit = clamp_int(limit, 1, 50)
@@ -2298,7 +2789,7 @@ def dynamic_wikidot_source(site: str) -> SourceConfig:
         kind=SourceKind.WIKIDOT,
         canon=f"Dynamic Wikidot ({host})",
         priority=90,
-        base_urls=(f"https://{host}", f"http://{host}"),
+        base_urls=(f"https://{host}",),
         aliases=(),
         tags=("dynamic", "wikidot"),
         archive_domains=(host,),
@@ -2322,7 +2813,16 @@ class OmniLoreEngine:
         languages: Optional[Sequence[str]] = None,
     ) -> List[SourceConfig]:
         if source_ids:
-            selected = [self.registry.get(source_id) for source_id in source_ids]
+            deduped_ids: List[str] = []
+            for source_id in source_ids:
+                normalized = (source_id or "").strip()
+                if normalized and normalized not in deduped_ids:
+                    deduped_ids.append(normalized)
+            if len(deduped_ids) > MAX_SOURCE_IDS_PER_REQUEST:
+                raise BadSourceQuery(
+                    f"At most {MAX_SOURCE_IDS_PER_REQUEST} source IDs may be requested at once."
+                )
+            selected = [self.registry.get(source_id) for source_id in deduped_ids]
         else:
             scope_key = scope.casefold()
             if scope_key == "core":
@@ -2361,6 +2861,8 @@ class OmniLoreEngine:
         query = normalize_query(query)
         if not query:
             raise BadSourceQuery("Omni search query cannot be empty.")
+        if len(query) > MAX_QUERY_CHARS:
+            raise BadSourceQuery(f"Omni search query must not exceed {MAX_QUERY_CHARS} characters.")
 
         sources = self._select_sources(
             scope=scope,
@@ -2424,16 +2926,22 @@ class OmniLoreEngine:
 
         ranked = sorted(deduped.values(), key=lambda hit: hit.score, reverse=True)
         ranked = ranked[:total_limit]
+        successful_sources = sum(1 for row in source_status if row["ok"])
+        if sources and successful_sources == 0:
+            raise SourceUnavailable(
+                f"No selected source could be searched reliably for '{query}'."
+            )
 
         return {
             "ok": True,
+            "status": "ok" if ranked else "search_no_match",
             "query": query,
             "scope": scope,
             "results": [hit.to_dict() for hit in ranked],
             "source_status": source_status,
             "meta": {
                 "searched_sources": len(sources),
-                "successful_sources": sum(1 for row in source_status if row["ok"]),
+                "successful_sources": successful_sources,
                 "failed_sources": sum(1 for row in source_status if not row["ok"]),
                 "result_count": len(ranked),
                 "timestamp": utc_now_iso(),
@@ -2458,14 +2966,29 @@ class OmniLoreEngine:
         )
         hits = search_result["results"]
         if not hits:
+            if search_result.get("meta", {}).get("successful_sources", 0) == 0:
+                raise SourceUnavailable(
+                    f"No selected source could be searched for '{query}'."
+                )
             raise PageNotFound(f"No lore page matching '{query}' across selected sources.")
 
+        eligible_hits = [
+            hit for hit in hits
+            if allow_archive_fallback or not bool(hit.get("archived"))
+        ]
+        if not eligible_hits:
+            raise PageNotFound(
+                f"Only historical archive candidates matched '{query}', and archive fallback is disabled."
+            )
+
         attempts = []
-        for hit in hits[:12]:
+        saw_not_found = False
+        saw_unavailable = False
+        for hit in eligible_hits[:12]:
             source = self.registry.get(hit["source_id"])
             try:
-                page = await adapter_for(source).fetch_page(
-                    hit["title"],
+                page = await adapter_for(source).fetch_hit(
+                    SearchHit(**hit),
                     max_chars=max_chars,
                     allow_archive_fallback=allow_archive_fallback,
                 )
@@ -2474,9 +2997,27 @@ class OmniLoreEngine:
                     "query": query,
                     "selected_result": hit,
                     "page": page.to_dict(),
-                    "alternatives": hits[1:8],
+                    "alternatives": eligible_hits[1:8],
                     "attempts": attempts,
                 }
+            except PageNotFound as exc:
+                saw_not_found = True
+                attempts.append(
+                    {
+                        "source_id": source.id,
+                        "title": hit["title"],
+                        "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                    }
+                )
+            except SourceUnavailable as exc:
+                saw_unavailable = True
+                attempts.append(
+                    {
+                        "source_id": source.id,
+                        "title": hit["title"],
+                        "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                    }
+                )
             except Exception as exc:
                 attempts.append(
                     {
@@ -2486,6 +3027,14 @@ class OmniLoreEngine:
                     }
                 )
 
+        if saw_not_found:
+            raise PageNotFound(
+                f"No safely resolvable lore page matching '{query}' across selected sources."
+            )
+        if saw_unavailable:
+            raise SourceUnavailable(
+                f"Search found candidates for '{query}', but upstream retrieval was unavailable."
+            )
         raise SourceUnavailable(
             f"Search found candidates for '{query}', but all top candidate fetches failed."
         )
@@ -2497,6 +3046,7 @@ class OmniLoreEngine:
         source_ids: Optional[Sequence[str]] = None,
         scope: str = "core",
         max_chars_per_source: int = 16000,
+        allow_archive_fallback: bool = False,
     ) -> dict:
         """Compare a concept across sources using compact canon-separated records.
 
@@ -2524,7 +3074,7 @@ class OmniLoreEngine:
                     page = await adapter_for(source).fetch_page(
                         query,
                         max_chars=max_chars_per_source,
-                        allow_archive_fallback=True,
+                        allow_archive_fallback=allow_archive_fallback,
                     )
                     payload = page.to_dict()
                     analysis = payload.get("analysis", {})
@@ -2551,11 +3101,21 @@ class OmniLoreEngine:
                         "source_name": source.name,
                         "canon": source.canon,
                         "ok": False,
+                        "error_type": type(exc).__name__,
                         "error": f"{type(exc).__name__}: {str(exc)[:500]}",
                     }
 
         records = await asyncio.gather(*(fetch_one(source) for source in sources))
         successful = [record for record in records if record["ok"]]
+        if sources and not successful:
+            failure_types = {record.get("error_type") for record in records}
+            if failure_types and failure_types <= {"PageNotFound"}:
+                raise PageNotFound(
+                    f"No selected source contained a page matching '{query}'."
+                )
+            raise SourceUnavailable(
+                f"No selected source could be fetched reliably for comparison '{query}'."
+            )
 
         comparison_matrix = [
             {
@@ -2622,6 +3182,8 @@ class OmniLoreEngine:
                     "error": row["error"],
                 }
             )
+        if sources and not any(item["ok"] for item in status):
+            raise SourceUnavailable("No selected source could provide recent changes reliably.")
         return {
             "ok": True,
             "results": [hit.to_dict() for hit in hits[:total_limit]],
@@ -2642,13 +3204,21 @@ class OmniLoreEngine:
         source = self.registry.get(source_id)
         adapter = adapter_for(source)
 
-        root = await adapter.fetch_page(page, max_chars=40000)
+        root = await adapter.fetch_page(
+            page,
+            max_chars=40000,
+            allow_archive_fallback=False,
+        )
         nodes: Dict[str, dict] = {
             root.url: {
                 "id": stable_hash(root.url),
                 "title": root.title,
                 "url": root.url,
                 "depth": 0,
+                "source_id": root.source_id,
+                "canon": root.canon,
+                "archived": root.archived,
+                "retrieved_at": root.retrieved_at,
             }
         }
         edges: List[dict] = []
@@ -2680,6 +3250,9 @@ class OmniLoreEngine:
                         "title": title,
                         "url": url,
                         "depth": current_depth + 1,
+                        "source_id": current.source_id,
+                        "canon": current.canon,
+                        "archived": False,
                     },
                 )
                 edges.append(
@@ -2687,13 +3260,19 @@ class OmniLoreEngine:
                         "from": stable_hash(current.url),
                         "to": node_id,
                         "label": "links_to",
+                        "source_id": current.source_id,
+                        "archived": current.archived,
                     }
                 )
 
                 if current_depth + 1 < depth and url not in visited_pages:
                     visited_pages.add(url)
                     try:
-                        child = await adapter.fetch_page(title, max_chars=20000)
+                        child = await adapter.fetch_page(
+                            title,
+                            max_chars=20000,
+                            allow_archive_fallback=False,
+                        )
                         frontier.append((child, current_depth + 1))
                     except Exception:
                         continue
@@ -2753,6 +3332,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# The API remains usable without an account, so public retrieval needs a small
+# process-local brake against outbound fan-out.  This is deliberately a
+# best-effort guard (a CDN/WAF can add stronger shared limits in production);
+# individual routes still clamp result sizes and concurrency.
+public_outbound_limiter = FixedWindowRateLimiter(max_keys=8_192)
+PUBLIC_OUTBOUND_PATH_PREFIXES = (
+    "/sources/health",
+    "/source/",
+    "/omni/",
+    "/archives/",
+    "/dynamic/",
+    "/url/read",
+    "/fandom/",
+    "/wikidot/",
+    "/cinematic/",
+    "/selftest",
+    "/atlas/index/search",
+    "/atlas/media/commons/search",
+)
+
+
+@app.middleware("http")
+async def public_outbound_rate_limit(request: Request, call_next):
+    path = request.url.path
+    if request.method == "GET" and any(path.startswith(prefix) for prefix in PUBLIC_OUTBOUND_PATH_PREFIXES):
+        client = request.client.host if request.client else "unknown"
+        if not public_outbound_limiter.allow(
+            "global",
+            limit=PUBLIC_OUTBOUND_GLOBAL_PER_MINUTE,
+            window_seconds=60,
+        ) or not public_outbound_limiter.allow(
+            f"client:{client}",
+            limit=PUBLIC_OUTBOUND_REQUESTS_PER_MINUTE,
+            window_seconds=60,
+        ):
+            return error_response(
+                429,
+                "rate_limited",
+                "Public retrieval rate limit exceeded. Try again shortly.",
+                retryable=True,
+                headers={"Retry-After": "60"},
+            )
+    return await call_next(request)
+
 
 @app.middleware("http")
 async def request_telemetry(request: Request, call_next):
@@ -2767,6 +3390,9 @@ async def request_telemetry(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     response.headers["X-BackroomsGPT-Version"] = APP_VERSION
     response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
     logger.info(
         "%s %s -> %s in %sms | id=%s",
         request.method,
@@ -2861,11 +3487,12 @@ async def list_sources(
 async def source_health(
     source_ids: Optional[str] = Query(
         default=None,
+        max_length=2000,
         description="Comma-separated source IDs. Omit to probe core sources.",
     ),
 ):
     if source_ids:
-        sources = [registry.get(item.strip()) for item in source_ids.split(",") if item.strip()]
+        sources = [registry.get(item) for item in (parse_csv_param(source_ids) or [])]
     else:
         sources = omni._select_sources(scope="core")
 
@@ -2898,15 +3525,16 @@ async def source_health(
 
 @app.get("/source/search", tags=["Sources"])
 async def source_search(
-    source_id: str,
-    q: str,
-    limit: int = 10,
+    source_id: str = Query(min_length=1, max_length=120),
+    q: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    limit: int = Query(default=10, ge=1, le=MAX_SOURCE_SEARCH_RESULTS),
 ):
     try:
         source = registry.get(source_id)
         hits = await adapter_for(source).search(q, limit=limit)
         return {
             "ok": True,
+            "status": "ok" if hits else "search_no_match",
             "source": source.public_dict(),
             "query": normalize_query(q),
             "results": [hit.to_dict() for hit in hits],
@@ -2921,19 +3549,19 @@ async def source_search(
 
 @app.get("/source/page", tags=["Sources"])
 async def source_page(
-    source_id: str,
-    page: str,
-    max_chars: int = DEFAULT_MAX_TEXT_CHARS,
-    allow_archive_fallback: bool = True,
+    source_id: str = Query(min_length=1, max_length=120),
+    page: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    max_chars: int = Query(default=ACTION_DEFAULT_MAX_TEXT_CHARS, ge=2_000, le=ACTION_ABSOLUTE_MAX_TEXT_CHARS),
+    allow_archive_fallback: bool = False,
 ):
     try:
         source = registry.get(source_id)
         payload = await adapter_for(source).fetch_page(
             page,
-            max_chars=max_chars,
+            max_chars=action_text_budget(max_chars),
             allow_archive_fallback=allow_archive_fallback,
         )
-        return {"ok": True, "page": payload.to_dict()}
+        return {"ok": True, "page": action_page_payload(payload)}
     except SourceNotFound as exc:
         return error_response(404, "source_not_found", str(exc))
     except PageNotFound as exc:
@@ -2946,8 +3574,8 @@ async def source_page(
 
 @app.get("/source/recent", tags=["Sources"])
 async def source_recent(
-    source_id: str,
-    limit: int = 10,
+    source_id: str = Query(min_length=1, max_length=120),
+    limit: int = Query(default=10, ge=1, le=50),
 ):
     try:
         source = registry.get(source_id)
@@ -2972,18 +3600,28 @@ async def source_recent(
 def parse_csv_param(value: Optional[str]) -> Optional[List[str]]:
     if not value:
         return None
-    items = [item.strip() for item in value.split(",") if item.strip()]
+    if len(value) > 2000:
+        raise BadSourceQuery("Comma-separated parameter is too long.")
+    items: List[str] = []
+    for item in value.split(","):
+        normalized = item.strip()
+        if normalized and normalized not in items:
+            items.append(normalized)
+    if len(items) > MAX_SOURCE_IDS_PER_REQUEST:
+        raise BadSourceQuery(
+            f"At most {MAX_SOURCE_IDS_PER_REQUEST} values may be requested at once."
+        )
     return items or None
 
 
 @app.get("/omni/search", tags=["Omni Lore"])
 async def omni_search(
-    q: str,
-    scope: str = "core",
-    source_ids: Optional[str] = None,
-    languages: Optional[str] = None,
-    per_source_limit: int = 6,
-    total_limit: int = 40,
+    q: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    scope: str = Query(default="core", max_length=20),
+    source_ids: Optional[str] = Query(default=None, max_length=2000),
+    languages: Optional[str] = Query(default=None, max_length=2000),
+    per_source_limit: int = Query(default=6, ge=1, le=15),
+    total_limit: int = Query(default=40, ge=1, le=100),
 ):
     try:
         return await omni.search(
@@ -2996,24 +3634,35 @@ async def omni_search(
         )
     except (BadSourceQuery, SourceNotFound) as exc:
         return error_response(400, "bad_query", str(exc))
+    except SourceUnavailable as exc:
+        return error_response(503, "source_unavailable", str(exc), retryable=True)
 
 
 @app.get("/omni/resolve", tags=["Omni Lore"])
 async def omni_resolve(
-    q: str,
-    scope: str = "core",
-    source_ids: Optional[str] = None,
-    max_chars: int = DEFAULT_MAX_TEXT_CHARS,
-    allow_archive_fallback: bool = True,
+    q: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    scope: str = Query(default="core", max_length=20),
+    source_ids: Optional[str] = Query(default=None, max_length=2000),
+    max_chars: int = Query(default=ACTION_DEFAULT_MAX_TEXT_CHARS, ge=2_000, le=ACTION_ABSOLUTE_MAX_TEXT_CHARS),
+    allow_archive_fallback: bool = False,
 ):
     try:
-        return await omni.resolve_and_fetch(
+        result = await omni.resolve_and_fetch(
             q,
             scope=scope,
             source_ids=parse_csv_param(source_ids),
-            max_chars=max_chars,
+            max_chars=action_text_budget(max_chars),
             allow_archive_fallback=allow_archive_fallback,
         )
+        page_data = result.get("page")
+        if isinstance(page_data, dict):
+            # Reconstruct only to reuse the one bounded serialization path.
+            result["page"] = action_page_payload(PagePayload(**{
+                key: page_data[key]
+                for key in PagePayload.__dataclass_fields__
+                if key in page_data
+            }))
+        return result
     except PageNotFound as exc:
         return error_response(404, "no_match", str(exc))
     except SourceUnavailable as exc:
@@ -3024,10 +3673,11 @@ async def omni_resolve(
 
 @app.get("/omni/compare", tags=["Omni Lore"])
 async def omni_compare(
-    q: str,
-    scope: str = "core",
-    source_ids: Optional[str] = None,
-    max_chars_per_source: int = 16000,
+    q: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    scope: str = Query(default="core", max_length=20),
+    source_ids: Optional[str] = Query(default=None, max_length=2000),
+    max_chars_per_source: int = Query(default=16000, ge=4_000, le=40_000),
+    allow_archive_fallback: bool = False,
 ):
     try:
         return await omni.compare(
@@ -3035,17 +3685,20 @@ async def omni_compare(
             source_ids=parse_csv_param(source_ids),
             scope=scope,
             max_chars_per_source=max_chars_per_source,
+            allow_archive_fallback=allow_archive_fallback,
         )
     except (BadSourceQuery, SourceNotFound) as exc:
         return error_response(400, "bad_query", str(exc))
+    except SourceUnavailable as exc:
+        return error_response(503, "source_unavailable", str(exc), retryable=True)
 
 
 @app.get("/omni/recent", tags=["Omni Lore"])
 async def omni_recent(
-    scope: str = "core",
-    source_ids: Optional[str] = None,
-    per_source_limit: int = 8,
-    total_limit: int = 40,
+    scope: str = Query(default="core", max_length=20),
+    source_ids: Optional[str] = Query(default=None, max_length=2000),
+    per_source_limit: int = Query(default=8, ge=1, le=20),
+    total_limit: int = Query(default=40, ge=1, le=100),
 ):
     try:
         return await omni.recent_across_sources(
@@ -3056,14 +3709,16 @@ async def omni_recent(
         )
     except (BadSourceQuery, SourceNotFound) as exc:
         return error_response(400, "bad_query", str(exc))
+    except SourceUnavailable as exc:
+        return error_response(503, "source_unavailable", str(exc), retryable=True)
 
 
 @app.get("/omni/graph", tags=["Omni Lore"])
 async def omni_graph(
-    source_id: str,
-    page: str,
-    depth: int = 1,
-    max_nodes: int = 25,
+    source_id: str = Query(min_length=1, max_length=120),
+    page: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    depth: int = Query(default=1, ge=1, le=2),
+    max_nodes: int = Query(default=25, ge=2, le=60),
 ):
     try:
         return await omni.build_link_graph(
@@ -3086,8 +3741,8 @@ async def omni_graph(
 
 @app.get("/archives/liminal/search", tags=["Liminal Archives"])
 async def search_liminal_archives(
-    q: str,
-    limit: int = 10,
+    q: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    limit: int = Query(default=10, ge=1, le=MAX_SOURCE_SEARCH_RESULTS),
 ):
     """
     Search Liminal Archives live first, then its configured archival domains.
@@ -3098,6 +3753,7 @@ async def search_liminal_archives(
         hits = await adapter_for(source).search(q, limit=limit)
         return {
             "ok": True,
+            "status": "ok" if hits else "search_no_match",
             "source": source.public_dict(),
             "query": normalize_query(q),
             "results": [hit.to_dict() for hit in hits],
@@ -3114,9 +3770,9 @@ async def search_liminal_archives(
 
 @app.get("/archives/liminal", tags=["Liminal Archives"])
 async def get_liminal_archives(
-    page: str,
-    max_chars: int = DEFAULT_MAX_TEXT_CHARS,
-    allow_archive_fallback: bool = True,
+    page: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    max_chars: int = Query(default=ACTION_DEFAULT_MAX_TEXT_CHARS, ge=2_000, le=ACTION_ABSOLUTE_MAX_TEXT_CHARS),
+    allow_archive_fallback: bool = False,
 ):
     """
     Backward-compatible route with corrected live Wikidot resolution and
@@ -3126,10 +3782,10 @@ async def get_liminal_archives(
         source = registry.get("liminal-archives")
         payload = await adapter_for(source).fetch_page(
             page,
-            max_chars=max_chars,
+            max_chars=action_text_budget(max_chars),
             allow_archive_fallback=allow_archive_fallback,
         )
-        return {"ok": True, "page": payload.to_dict()}
+        return {"ok": True, "page": action_page_payload(payload)}
     except PageNotFound as exc:
         return error_response(
             404,
@@ -3148,7 +3804,7 @@ async def get_liminal_archives(
 
 
 @app.get("/archives/liminal/recent", tags=["Liminal Archives"])
-async def recent_liminal_archives(limit: int = 10):
+async def recent_liminal_archives(limit: int = Query(default=10, ge=1, le=50)):
     try:
         source = registry.get("liminal-archives")
         hits = await adapter_for(source).recent(limit=limit)
@@ -3173,15 +3829,16 @@ async def recent_liminal_archives(limit: int = 10):
 
 @app.get("/dynamic/fandom/search", tags=["Dynamic Sources"])
 async def dynamic_fandom_search(
-    site: str,
-    q: str,
-    limit: int = 10,
+    site: str = Query(min_length=3, max_length=253),
+    q: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    limit: int = Query(default=10, ge=1, le=MAX_SOURCE_SEARCH_RESULTS),
 ):
     try:
         source = dynamic_fandom_source(site)
         hits = await MediaWikiAdapter(source).search(q, limit=limit)
         return {
             "ok": True,
+            "status": "ok" if hits else "search_no_match",
             "source": source.public_dict(),
             "query": normalize_query(q),
             "results": [hit.to_dict() for hit in hits],
@@ -3194,14 +3851,20 @@ async def dynamic_fandom_search(
 
 @app.get("/dynamic/fandom/page", tags=["Dynamic Sources"])
 async def dynamic_fandom_page(
-    site: str,
-    page: str,
-    max_chars: int = DEFAULT_MAX_TEXT_CHARS,
+    site: str = Query(min_length=3, max_length=253),
+    page: Optional[str] = Query(default=None, min_length=1, max_length=MAX_QUERY_CHARS),
+    # Backward-compatible alias for the v20 Action schema. v21 documents
+    # `page`, but an older configured GPT that sends `title` still works.
+    title: Optional[str] = Query(default=None, min_length=1, max_length=MAX_QUERY_CHARS),
+    max_chars: int = Query(default=ACTION_DEFAULT_MAX_TEXT_CHARS, ge=2_000, le=ACTION_ABSOLUTE_MAX_TEXT_CHARS),
 ):
     try:
         source = dynamic_fandom_source(site)
-        payload = await MediaWikiAdapter(source).fetch_page(page, max_chars=max_chars)
-        return {"ok": True, "page": payload.to_dict()}
+        locator = page or title
+        if not locator:
+            raise BadSourceQuery("A page title is required.")
+        payload = await MediaWikiAdapter(source).fetch_page(locator, max_chars=action_text_budget(max_chars))
+        return {"ok": True, "page": action_page_payload(payload)}
     except (UnsafeTarget, BadSourceQuery) as exc:
         return error_response(400, "unsafe_or_invalid_target", str(exc))
     except PageNotFound as exc:
@@ -3212,15 +3875,16 @@ async def dynamic_fandom_page(
 
 @app.get("/dynamic/wikidot/search", tags=["Dynamic Sources"])
 async def dynamic_wikidot_search(
-    site: str,
-    q: str,
-    limit: int = 10,
+    site: str = Query(min_length=3, max_length=253),
+    q: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    limit: int = Query(default=10, ge=1, le=MAX_SOURCE_SEARCH_RESULTS),
 ):
     try:
         source = dynamic_wikidot_source(site)
         hits = await WikidotAdapter(source).search(q, limit=limit)
         return {
             "ok": True,
+            "status": "ok" if hits else "search_no_match",
             "source": source.public_dict(),
             "query": normalize_query(q),
             "results": [hit.to_dict() for hit in hits],
@@ -3233,19 +3897,19 @@ async def dynamic_wikidot_search(
 
 @app.get("/dynamic/wikidot/page", tags=["Dynamic Sources"])
 async def dynamic_wikidot_page(
-    site: str,
-    page: str,
-    max_chars: int = DEFAULT_MAX_TEXT_CHARS,
-    allow_archive_fallback: bool = True,
+    site: str = Query(min_length=3, max_length=253),
+    page: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+    max_chars: int = Query(default=ACTION_DEFAULT_MAX_TEXT_CHARS, ge=2_000, le=ACTION_ABSOLUTE_MAX_TEXT_CHARS),
+    allow_archive_fallback: bool = False,
 ):
     try:
         source = dynamic_wikidot_source(site)
         payload = await WikidotAdapter(source).fetch_page(
             page,
-            max_chars=max_chars,
+            max_chars=action_text_budget(max_chars),
             allow_archive_fallback=allow_archive_fallback,
         )
-        return {"ok": True, "page": payload.to_dict()}
+        return {"ok": True, "page": action_page_payload(payload)}
     except (UnsafeTarget, BadSourceQuery) as exc:
         return error_response(400, "unsafe_or_invalid_target", str(exc))
     except PageNotFound as exc:
@@ -3260,8 +3924,8 @@ async def dynamic_wikidot_page(
 
 @app.get("/url/read", tags=["Dynamic Sources"])
 async def read_supported_wiki_url(
-    url: str,
-    max_chars: int = DEFAULT_MAX_TEXT_CHARS,
+    url: str = Query(min_length=8, max_length=2048),
+    max_chars: int = Query(default=ACTION_DEFAULT_MAX_TEXT_CHARS, ge=2_000, le=ACTION_ABSOLUTE_MAX_TEXT_CHARS),
 ):
     """
     Read a user-supplied Fandom or Wikidot URL without needing a pre-registered
@@ -3272,6 +3936,13 @@ async def read_supported_wiki_url(
         parsed = urlparse(safe_url)
         host = parsed.hostname or ""
 
+        if host in {"web.archive.org", "archive.org"}:
+            return error_response(
+                400,
+                "unsupported_source",
+                "Direct archive URLs are not read as live pages. Use the source-specific archive fallback instead.",
+            )
+
         if host.endswith(".fandom.com"):
             # Try to derive article title and use MediaWiki API.
             path_parts = [part for part in parsed.path.split("/") if part]
@@ -3281,18 +3952,18 @@ async def read_supported_wiki_url(
             else:
                 title = unquote(path_parts[-1] if path_parts else "").replace("_", " ")
             source = dynamic_fandom_source(host)
-            payload = await MediaWikiAdapter(source).fetch_page(title, max_chars=max_chars)
-            return {"ok": True, "page": payload.to_dict()}
+            payload = await MediaWikiAdapter(source).fetch_page(title, max_chars=action_text_budget(max_chars))
+            return {"ok": True, "page": action_page_payload(payload)}
 
         if host.endswith(".wikidot.com"):
             page = unquote(parsed.path.strip("/"))
             source = dynamic_wikidot_source(host)
             payload = await WikidotAdapter(source).fetch_page(
                 page,
-                max_chars=max_chars,
-                allow_archive_fallback=True,
+                max_chars=action_text_budget(max_chars),
+                allow_archive_fallback=False,
             )
-            return {"ok": True, "page": payload.to_dict()}
+            return {"ok": True, "page": action_page_payload(payload)}
 
         # Explicit configured host fallback.
         response, diagnostics = await network.get(safe_url, retries=1, allow_404=True)
@@ -3301,26 +3972,24 @@ async def read_supported_wiki_url(
         doc = sanitize_html_document(
             response.text,
             page_url=str(response.url),
-            max_chars=max_chars,
+            max_chars=action_text_budget(max_chars),
         )
-        return {
-            "ok": True,
-            "page": {
-                "source_id": "dynamic-url",
-                "source_name": host,
-                "canon": "Unclassified external Backrooms source",
-                "title": doc.title,
-                "url": str(response.url),
-                "text": doc.text,
-                "headings": doc.headings,
-                "links": doc.links,
-                "image_urls": doc.image_urls,
-                "analysis": LoreAnalyzer.analyze(doc),
-                "retrieved_at": utc_now_iso(),
-                "archived": False,
-                "upstream_diagnostics": [asdict(d) for d in diagnostics],
-            },
-        }
+        payload = PagePayload(
+            source_id="dynamic-url",
+            source_name=host,
+            canon="Unclassified external Backrooms source",
+            title=doc.title,
+            url=str(response.url),
+            text=doc.text,
+            headings=doc.headings,
+            links=doc.links,
+            image_urls=doc.image_urls,
+            analysis=LoreAnalyzer.analyze(doc),
+            retrieved_at=utc_now_iso(),
+            archived=False,
+            upstream_diagnostics=[asdict(d) for d in diagnostics],
+        )
+        return {"ok": True, "page": action_page_payload(payload)}
     except UnsafeTarget as exc:
         return error_response(400, "unsafe_target", str(exc))
     except PageNotFound as exc:
@@ -3334,7 +4003,7 @@ async def read_supported_wiki_url(
 # =============================================================================
 
 @app.get("/fandom/search", tags=["Legacy Compatibility"])
-async def legacy_fandom_search(q: str):
+async def legacy_fandom_search(q: str = Query(min_length=1, max_length=MAX_QUERY_CHARS)):
     source = registry.get("fandom-main")
     try:
         hits = await MediaWikiAdapter(source).search(q, limit=10)
@@ -3361,7 +4030,7 @@ async def legacy_fandom_search(q: str):
 
 
 @app.get("/fandom/page", tags=["Legacy Compatibility"])
-async def legacy_fandom_page(title: str):
+async def legacy_fandom_page(title: str = Query(min_length=1, max_length=MAX_QUERY_CHARS)):
     source = registry.get("fandom-main")
     try:
         payload = await MediaWikiAdapter(source).fetch_page(title)
@@ -3373,7 +4042,7 @@ async def legacy_fandom_page(title: str):
 
 
 @app.get("/wikidot/page", tags=["Legacy Compatibility"])
-async def legacy_wikidot_page(url: str):
+async def legacy_wikidot_page(url: str = Query(min_length=1, max_length=MAX_QUERY_CHARS)):
     source = registry.get("wikidot-main")
     try:
         payload = await WikidotAdapter(source).fetch_page(url)
@@ -3385,7 +4054,10 @@ async def legacy_wikidot_page(url: str):
 
 
 @app.get("/wikidot/international", tags=["Legacy Compatibility"])
-async def legacy_international_wikidot(lang: str, page: str):
+async def legacy_international_wikidot(
+    lang: str = Query(min_length=2, max_length=10),
+    page: str = Query(min_length=1, max_length=MAX_QUERY_CHARS),
+):
     language_map = {
         "ru": "wikidot-ru",
         "cn": "wikidot-cn",
@@ -3420,7 +4092,7 @@ async def legacy_international_wikidot(lang: str, page: str):
 
 
 @app.get("/wikidot/freewriting", tags=["Legacy Compatibility"])
-async def legacy_freewriting(page: str):
+async def legacy_freewriting(page: str = Query(min_length=1, max_length=MAX_QUERY_CHARS)):
     source = registry.get("freewriting-fandom")
     try:
         payload = await MediaWikiAdapter(source).fetch_page(page)
@@ -3432,7 +4104,7 @@ async def legacy_freewriting(page: str):
 
 
 @app.get("/cinematic/kanepixels", tags=["Legacy Compatibility"])
-async def legacy_kane_pixels(topic: str):
+async def legacy_kane_pixels(topic: str = Query(min_length=1, max_length=MAX_QUERY_CHARS)):
     source = registry.get("kanepixels-fandom")
     try:
         payload = await MediaWikiAdapter(source).fetch_page(topic)
@@ -3470,8 +4142,9 @@ def legacy_content_wrapper(payload: PagePayload) -> dict:
 @app.get("/selftest", tags=["System"])
 async def selftest():
     """
-    Non-destructive diagnostic that validates local routing and optionally
-    performs tiny live probes against core sources.
+    Non-destructive local diagnostic.  It intentionally never sends upstream
+    requests: public source probes belong to the separately bounded
+    ``/sources/health`` endpoint.
     """
     local_checks = {
         "slug_level_0": generate_slug_candidates("Level 0")[:8],
@@ -3481,34 +4154,12 @@ async def selftest():
         "source_ids": registry.all_ids(),
     }
 
-    probe_targets = [
-        registry.get("fandom-main"),
-        registry.get("wikidot-main"),
-        registry.get("liminal-archives"),
-    ]
-    probes = await asyncio.gather(
-        *(adapter_for(source).probe() for source in probe_targets),
-        return_exceptions=True,
-    )
-
-    normalized_probes = []
-    for source, probe in zip(probe_targets, probes):
-        if isinstance(probe, Exception):
-            normalized_probes.append(
-                {
-                    "source_id": source.id,
-                    "ok": False,
-                    "error": f"{type(probe).__name__}: {probe}",
-                }
-            )
-        else:
-            normalized_probes.append(probe)
-
     return {
         "ok": True,
         "version": APP_VERSION,
         "local_checks": local_checks,
-        "live_probes": normalized_probes,
+        "live_probes": [],
+        "note": "No live probes were executed. Use /sources/health for bounded live source status.",
         "timestamp": utc_now_iso(),
     }
 
@@ -3542,6 +4193,46 @@ async def bad_query_handler(request: Request, exc: BadSourceQuery):
     return error_response(400, "bad_query", str(exc))
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(request: Request, exc: RequestValidationError):
+    issues = [
+        {
+            "location": ".".join(str(part) for part in error.get("loc", [])[1:]),
+            "message": error.get("msg", "Invalid value"),
+            "type": error.get("type", "validation_error"),
+        }
+        for error in exc.errors()[:12]
+    ]
+    return error_response(
+        422,
+        "validation_failure",
+        "Request validation failed.",
+        details={"issues": issues},
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    codes = {
+        401: "auth_required",
+        403: "forbidden",
+        404: "not_found",
+        409: "conflict",
+        413: "request_too_large",
+        422: "validation_failure",
+        429: "rate_limited",
+        503: "service_unavailable",
+    }
+    detail = exc.detail if isinstance(exc.detail, str) else "Request could not be completed."
+    return error_response(
+        exc.status_code,
+        codes.get(exc.status_code, "request_error"),
+        detail,
+        retryable=exc.status_code in {429, 503},
+        headers=exc.headers,
+    )
+
+
 # =============================================================================
 # END OF BACKROOMSGPT OMNI-LORE GATEWAY
 # =============================================================================
@@ -3559,4 +4250,10 @@ atlas_platform = install_atlas_platform(
     adapter_for=adapter_for,
     network=network,
     utc_now_iso=utc_now_iso,
+    validate_discovery_url=validate_discovery_seed_url,
 )
+
+# Add the ASGI body cap after all decorator middleware registrations so it is
+# the outermost application guard: an oversized request is rejected before
+# authentication, route middleware, or Pydantic can read it.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)

@@ -271,40 +271,63 @@ def levenshtein_distance(s1: str, s2: str) -> int:
     return previous_row[-1]
 
 def generate_smart_slug_matrix(raw_input: str, is_intl: bool = False, lang: str = "") -> List[str]:
+    """
+    The Ultimate Permutation Engine v12.1. Collapses multi-dashes, handles casing dynamically,
+    and uses case-insensitive regex substitution to guarantee system page resolution (system:).
+    """
     base = unquote(raw_input).strip()
     
+    # 1. ניקוי וקיווץ מקפים כפולים ורווחים
     preserved = base.replace(" ", "-")
     preserved = re.sub(r'-{2,}', '-', preserved)
-    preserved = re.sub(r'[^a-zA-Z0-9:-]', '', preserved)
+    preserved = re.sub(r'[^a-zA-Z0-9:-]', '', preserved) # שמירה על נקודתיים קיימים
     
+    # 2. יצירת וריאציה נקייה באותיות קטנות
     lowered = preserved.lower()
+    
+    # חילוץ מספרים
     numbers = ''.join(filter(str.isdigit, base))
     has_numbers = bool(numbers)
     
     variants = set()
+    
+    # הוספת הזרמים הראשיים
     variants.update([
-        preserved, lowered, lowered.replace("-", ""), preserved.replace("-", ""),
-        lowered.replace("system-", "system:"), preserved.replace("system-", "system:"), base
+        preserved, 
+        lowered, 
+        lowered.replace("-", ""), 
+        preserved.replace("-", ""),
+        base
     ])
     
+    # תיקון קריטי: החלפה לא-רגישה לרישיות (Case-Insensitive) עבור דפי מערכת של ויקידוט
+    system_fixed_preserved = re.sub(r'^system-', 'system:', preserved, flags=re.IGNORECASE)
+    system_fixed_lowered = re.sub(r'^system-', 'system:', lowered, flags=re.IGNORECASE)
+    variants.update([system_fixed_preserved, system_fixed_lowered])
+    
+    # אם יש מספרים, נכסה את כל המבנים הנפוצים של הרמות
     if has_numbers:
         variants.update([
             f"level-{numbers}", f"level{numbers}", f"Level{numbers}", 
             f"Level-{numbers}", f"level_{numbers}", numbers
         ])
+        
         if is_intl and lang:
             lang_dict = {
                 "ru": f"uroven-{numbers}", "es": f"nivel-{numbers}",
                 "fr": f"niveau-{numbers}", "de": f"ebene-{numbers}",
-                "it": f"livello-{numbers}", "cn": f"level-{numbers}", "pl": f"poziom-{numbers}"
+                "it": f"livello-{numbers}", "cn": f"level-{numbers}", 
+                "pl": f"poziom-{numbers}"
             }
             if lang in lang_dict:
                 variants.update([lang_dict[lang], lang_dict[lang].replace("-", "")])
 
+    # כיסוי מקרי קצה של אותיות בודדות (כמו Level N) או רישיות מלאה
     variants.update([base.upper(), base.lower()])
     
+    # סינון ערכים ריקים ושמירה על סדר ייחודי
     ordered_variants = list(dict.fromkeys([v for v in variants if v]))
-    logger.info(f"[SLUG-MATRIX] Generated {len(ordered_variants)} quantum vectors for '{raw_input}'")
+    logger.info(f"[SLUG-MATRIX v12.1] Compiled and self-healed variants: {ordered_variants}")
     return ordered_variants
 
 # ==============================================================================

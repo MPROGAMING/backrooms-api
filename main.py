@@ -2597,7 +2597,10 @@ class WikidotAdapter(BaseAdapter):
         cached = await cache.get(cache_key)
         if cached is not None:
             if cached.get("_negative"):
-                raise PageNotFound(cached.get("message", "Page not found"))
+                message = cached.get("message", "Page not found")
+                if cached.get("error_type") == "SourceUnavailable":
+                    raise SourceUnavailable(message)
+                raise PageNotFound(message)
             return PagePayload(**cached)
 
         live_error: Optional[Exception] = None
@@ -2641,7 +2644,13 @@ class WikidotAdapter(BaseAdapter):
         message = str(live_error) if live_error else f"Page '{page}' not found."
         await cache.set(
             cache_key,
-            {"_negative": True, "message": message},
+            {
+                "_negative": True,
+                "message": message,
+                "error_type": "SourceUnavailable"
+                if isinstance(live_error, SourceUnavailable)
+                else "PageNotFound",
+            },
             negative=True,
         )
         if isinstance(live_error, SourceUnavailable):

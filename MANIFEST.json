@@ -1,0 +1,22 @@
+{
+  "README_APPLY.md": {
+    "size": 1047,
+    "sha256": "8537b271c9c162489d48c4d890e45fbb6bf0e0c9a737150abdcab2d2beeaa934"
+  },
+  "TESTS/test_v21_acceptance_hotfix.py": {
+    "size": 7788,
+    "sha256": "d3a90456058de08806b3b0a0d280a74e0fe7b9601ed13f169f24df8a6949ea8e"
+  },
+  "atlas/__init__.py": {
+    "size": 1745,
+    "sha256": "eafac2eb758ad947fb799616ce86a6dd700103ee06a804d94401499ad00d065b"
+  },
+  "atlas/indexer.py": {
+    "size": 9754,
+    "sha256": "f038065f9cc50dcaa50c69bdc8f228472689c7277228913dd568751058838c05"
+  },
+  "atlas/media.py": {
+    "size": 11564,
+    "sha256": "d6294356f8ad0aebc8084ca8d7a5024d5404540ffb56a57317bbefeb19784687"
+  }
+}

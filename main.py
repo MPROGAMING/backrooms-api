@@ -11,12 +11,12 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="M.E.G. Omni-Database API (Ultra-Max Sync)",
     description="Central routing node for Backrooms APIs including Fandom, Wikidot, Liminal Archives, and Kane Pixels.",
-    version="3.0.0"
+    version="4.0.0"
 )
 
 # הגדרת Timeout קשיח כדי למנוע קריסה של Render
 TIMEOUT_SETTINGS = httpx.Timeout(15.0)
-DEFAULT_HEADERS = {"User-Agent": "MEG-Archival-Bot/3.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+DEFAULT_HEADERS = {"User-Agent": "MEG-Archival-Bot/4.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 
 @app.get("/fandom/search")
 async def search_fandom(q: str):
@@ -67,7 +67,6 @@ async def get_wikidot_page(url: str):
 
 @app.get("/wikidot/international")
 async def get_international_wikidot(lang: str, page: str):
-    # ניסיון ראשון: עם מקף (הסטנדרט)
     url = f"https://backrooms-{lang}.wikidot.com/{page}"
     logger.info(f"Targeting International URL: {url}")
     
@@ -75,7 +74,6 @@ async def get_international_wikidot(lang: str, page: str):
         async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
             response = await client.get(url, headers=DEFAULT_HEADERS)
             
-            # אם לא נמצא, ננסה אוטומטית פורמט חלופי בלי מקף (נפוץ מאוד בשרתים בינלאומיים)
             if response.status_code == 404 and "-" in page:
                 alt_page = page.replace("-", "")
                 url = f"https://backrooms-{lang}.wikidot.com/{alt_page}"
@@ -92,7 +90,24 @@ async def get_international_wikidot(lang: str, page: str):
     except Exception as e:
         logger.error(f"International Wikidot Error: {e}")
         return JSONResponse(status_code=500, content={"error": f"International node '{lang}' connection failed: {str(e)}"})
-        
+
+@app.get("/wikidot/freewriting")
+async def get_free_writing_wiki(page: str):
+    url = f"https://backrooms-freewriting.wikidot.com/{page}"
+    logger.info(f"Targeting Free Writing Wiki URL: {url}")
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
+            response = await client.get(url, headers=DEFAULT_HEADERS)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
+                content_div = soup.find(id="page-content")
+                text = content_div.get_text(separator="\n", strip=True) if content_div else soup.get_text(separator="\n", strip=True)
+                return {"content": f"[FREE WRITING WIKI NODE]\n{text}"}
+            return JSONResponse(status_code=404, content={"error": f"Free Writing Wiki page '{page}' not found."})
+    except Exception as e:
+        logger.error(f"Free Writing Wiki Error: {e}")
+        return JSONResponse(status_code=500, content={"error": f"Free Writing Wiki connection failed: {str(e)}"})
+
 @app.get("/archives/liminal")
 async def get_liminal_archives(page: str):
     url = f"https://liminalarchives.xyz/wiki/{page}"
@@ -115,7 +130,6 @@ async def get_kane_pixels_lore(topic: str):
     search_params = {"action": "query", "list": "search", "srsearch": topic, "format": "json", "utf8": 1}
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
-            # שלב 1: חיפוש הנושא בקאנון של קיין פיקסלס
             search_res = await client.get(url, params=search_params)
             search_data = search_res.json()
             
@@ -124,7 +138,6 @@ async def get_kane_pixels_lore(topic: str):
                 
             exact_title = search_data["query"]["search"][0]["title"]
             
-            # שלב 2: שליפת התוכן המלא של העמוד שנמצא
             page_params = {"action": "parse", "page": exact_title, "format": "json", "prop": "text", "disabletoc": 1}
             page_res = await client.get(url, params=page_params)
             page_data = page_res.json()

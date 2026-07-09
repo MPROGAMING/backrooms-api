@@ -1,58 +1,128 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import JSONResponse
 import httpx
 from bs4 import BeautifulSoup
+import logging
 
-app = FastAPI(title="Backrooms Live API")
+# הגדרת מערכת לוגים ברמת שרת
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="M.E.G. Omni-Database API (Ultra-Max Sync)",
+    description="Central routing node for Backrooms APIs including Fandom, Wikidot, Liminal Archives, and Kane Pixels.",
+    version="3.0.0"
+)
+
+# הגדרת Timeout קשיח כדי למנוע קריסה של Render
+TIMEOUT_SETTINGS = httpx.Timeout(15.0)
+DEFAULT_HEADERS = {"User-Agent": "MEG-Archival-Bot/3.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 
 @app.get("/fandom/search")
 async def search_fandom(q: str):
-    # פנייה ל-API החי של Fandom Backrooms
     url = "https://backrooms.fandom.com/api.php"
-    params = {
-        "action": "query",
-        "list": "search",
-        "srsearch": q,
-        "format": "json",
-        "utf8": 1
-    }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, params=params)
-        return response.json()
+    params = {"action": "query", "list": "search", "srsearch": q, "format": "json", "utf8": 1}
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error(f"Fandom Search Error: {e}")
+        return JSONResponse(status_code=500, content={"error": "Fandom database node unreachable."})
 
 @app.get("/fandom/page")
 async def get_fandom_page(title: str):
-    # שליפת התוכן המלא והמעודכן של ערך בפאנדום
     url = "https://backrooms.fandom.com/api.php"
-    params = {
-        "action": "parse",
-        "page": title,
-        "format": "json",
-        "prop": "text",
-        "disabletoc": 1
-    }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, params=params)
-        data = response.json()
-        if "parse" in data:
-            raw_html = data["parse"]["text"]["*"]
-            soup = BeautifulSoup(raw_html, "html.parser")
-            return {"content": soup.get_text(separator="\n", strip=True)}
-        return {"error": "Page not found"}
+    params = {"action": "parse", "page": title, "format": "json", "prop": "text", "disabletoc": 1}
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
+            response = await client.get(url, params=params)
+            data = response.json()
+            if "parse" in data:
+                soup = BeautifulSoup(data["parse"]["text"]["*"], "html.parser")
+                clean_text = soup.get_text(separator="\n", strip=True)
+                return {"content": clean_text}
+            return JSONResponse(status_code=404, content={"error": f"Fandom page '{title}' not found."})
+    except Exception as e:
+        logger.error(f"Fandom Page Error: {e}")
+        return JSONResponse(status_code=500, content={"error": "Error parsing Fandom data stream."})
 
 @app.get("/wikidot/page")
 async def get_wikidot_page(url: str):
-    # שליפת עמוד או Sandbox בלייב מ-Wikidot וניקוי שלו
     if not url.startswith("http"):
         url = f"https://backrooms-wiki.wikidot.com/{url}"
-    
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, "html.parser")
-            # מוצא את תיבת התוכן המרכזית של וויקידוט ומנקה תפריטים
-            content_div = soup.find(id="page-content")
-            if content_div:
-                return {"content": content_div.get_text(separator="\n", strip=True)}
-            return {"content": soup.get_text(separator="\n", strip=True)}
-        return {"error": f"Failed to fetch Wikidot page: {response.status_code}"}
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
+            response = await client.get(url, headers=DEFAULT_HEADERS)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
+                content_div = soup.find(id="page-content")
+                text = content_div.get_text(separator="\n", strip=True) if content_div else soup.get_text(separator="\n", strip=True)
+                return {"content": text}
+            return JSONResponse(status_code=404, content={"error": f"Wikidot page unavailable. Status: {response.status_code}"})
+    except Exception as e:
+        logger.error(f"Wikidot Page Error: {e}")
+        return JSONResponse(status_code=500, content={"error": "Wikidot node connection timed out."})
+
+@app.get("/wikidot/international")
+async def get_international_wikidot(lang: str, page: str):
+    url = f"https://backrooms-{lang}.wikidot.com/{page}"
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
+            response = await client.get(url, headers=DEFAULT_HEADERS)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
+                content_div = soup.find(id="page-content")
+                text = content_div.get_text(separator="\n", strip=True) if content_div else soup.get_text(separator="\n", strip=True)
+                return {"content": f"[INTERNATIONAL NODE: {lang.upper()}]\n{text}"}
+            return JSONResponse(status_code=404, content={"error": f"International Wikidot branch '{lang}' page '{page}' not found."})
+    except Exception as e:
+        logger.error(f"International Wikidot Error: {e}")
+        return JSONResponse(status_code=500, content={"error": f"International node '{lang}' connection failed."})
+
+@app.get("/archives/liminal")
+async def get_liminal_archives(page: str):
+    url = f"https://liminalarchives.xyz/wiki/{page}"
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
+            response = await client.get(url, headers=DEFAULT_HEADERS)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
+                content_div = soup.find(id="mw-content-text")
+                text = content_div.get_text(separator="\n", strip=True) if content_div else soup.get_text(separator="\n", strip=True)
+                return {"content": f"[LIMINAL ARCHIVES NODE]\n{text}"}
+            return JSONResponse(status_code=404, content={"error": f"Liminal Archives page '{page}' not found."})
+    except Exception as e:
+        logger.error(f"Liminal Archives Error: {e}")
+        return JSONResponse(status_code=500, content={"error": "Liminal Archives database unreachable."})
+
+@app.get("/cinematic/kanepixels")
+async def get_kane_pixels_lore(topic: str):
+    url = "https://kane-pixels-backrooms.fandom.com/api.php"
+    search_params = {"action": "query", "list": "search", "srsearch": topic, "format": "json", "utf8": 1}
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
+            # שלב 1: חיפוש הנושא בקאנון של קיין פיקסלס
+            search_res = await client.get(url, params=search_params)
+            search_data = search_res.json()
+            
+            if not search_data.get("query", {}).get("search"):
+                return JSONResponse(status_code=404, content={"error": f"No cinematic records found for topic: {topic}"})
+                
+            exact_title = search_data["query"]["search"][0]["title"]
+            
+            # שלב 2: שליפת התוכן המלא של העמוד שנמצא
+            page_params = {"action": "parse", "page": exact_title, "format": "json", "prop": "text", "disabletoc": 1}
+            page_res = await client.get(url, params=page_params)
+            page_data = page_res.json()
+            
+            if "parse" in page_data:
+                soup = BeautifulSoup(page_data["parse"]["text"]["*"], "html.parser")
+                clean_text = soup.get_text(separator="\n", strip=True)
+                return {"content": f"[KANE PIXELS CANON FILE: {exact_title}]\n{clean_text}"}
+                
+            return JSONResponse(status_code=404, content={"error": "Failed to parse cinematic lore file."})
+    except Exception as e:
+        logger.error(f"Kane Pixels Lore Error: {e}")
+        return JSONResponse(status_code=500, content={"error": "Cinematic tracking node unreachable."})

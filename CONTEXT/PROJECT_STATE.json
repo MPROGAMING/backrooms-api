@@ -1,0 +1,35 @@
+{
+  "project": "BackroomsGPT",
+  "candidate": "BackroomsGPT FINAL v21.0.0",
+  "build": "BACKROOMSGPT-FINAL-21",
+  "github_repo": "MPROGAMING/backrooms-api",
+  "production_api": "https://backrooms-api.onrender.com",
+  "privacy_url": "https://backrooms-api.onrender.com/privacy",
+  "routes": 53,
+  "gpt_action_operations": 33,
+  "knowledge_files": 20,
+  "local_tests": {
+    "unit_contract_security_retrieval_total": "44 PASS",
+    "smoke": "PASS 21.0.0 53 routes",
+    "python": "3.12.13"
+  },
+  "production_baseline_before_v21": {
+    "version": "20.0.0",
+    "build": "ATLAS-OMNI-V20",
+    "v21_deployed": false
+  },
+  "production_retest_required": true,
+  "required_external_configuration": [
+    "Render persistent disk mounted at /var/data",
+    "BACKROOMSGPT_ACTION_API_KEY configured as a Render secret",
+    "same secret configured as Custom GPT Action API key/Bearer authentication"
+  ],
+  "finalization_focus": [
+    "strict provenance and canon separation",
+    "safe Liminal live/archive identity",
+    "bounded SSRF-safe retrieval",
+    "protected atomic Atlas writes",
+    "honest project durability/privacy",
+    "v21 Action and Knowledge consistency"
+  ]
+}

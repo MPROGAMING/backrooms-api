@@ -82,7 +82,7 @@ class MediaResearch:
                 "ok": False,
                 "query": query,
                 "results": [],
-                "error": "query cannot be empty",
+                "error": {"code": "validation_failure", "message": "query cannot be empty", "retryable": False},
             }
 
         # Search sequentially, following Wikimedia API etiquette. The variations
@@ -96,6 +96,7 @@ class MediaResearch:
 
         merged: Dict[int, Dict[str, Any]] = {}
         diagnostics: List[str] = []
+        successful_requests = 0
 
         for search_query in seen_variations:
             params = {
@@ -120,6 +121,7 @@ class MediaResearch:
 
             if not response or response.status_code != 200:
                 continue
+            successful_requests += 1
 
             try:
                 data = response.json()
@@ -183,13 +185,29 @@ class MediaResearch:
             reverse=True,
         )[:limit]
 
+        if not results and successful_requests == 0:
+            return {
+                "ok": False,
+                "query": query,
+                "source": "Wikimedia Commons",
+                "result_count": 0,
+                "results": [],
+                "diagnostics": diagnostics[-12:],
+                "error": {
+                    "code": "source_unavailable",
+                    "message": "Wikimedia Commons could not be queried reliably.",
+                    "retryable": True,
+                },
+            }
+
         return {
-            "ok": bool(results),
+            "ok": True,
             "query": query,
             "source": "Wikimedia Commons",
             "result_count": len(results),
             "results": results,
             "diagnostics": diagnostics[-12:],
+            "status": "ok" if results else "search_no_match",
             "note": (
                 "Candidates are relevance-ranked and filtered to image MIME types. "
                 "Verify each file description page, authorship, license, attribution, "

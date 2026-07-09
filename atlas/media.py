@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 from typing import Any, Dict, List
@@ -8,7 +9,7 @@ from typing import Any, Dict, List
 class MediaResearch:
     COMMONS_API = "https://commons.wikimedia.org/w/api.php"
     COMMONS_USER_AGENT = (
-        "BackroomsGPT-MediaResearch/20.1 "
+        "BackroomsGPT-MediaResearch/21.0 "
         "(https://backrooms-api.onrender.com/privacy; contact via Builder Profile)"
     )
 
@@ -35,44 +36,77 @@ class MediaResearch:
         }
 
     @classmethod
-    def _relevance_score(cls, query: str, title: str, description: str, categories: str) -> float:
-        q = cls._tokens(query)
-        if not q:
+    def _relevance_score(
+        cls, query: str, title: str, description: str, categories: str
+    ) -> float:
+        query_tokens = cls._tokens(query)
+        if not query_tokens:
             return 0.0
         title_tokens = cls._tokens(title)
         body_tokens = cls._tokens(f"{description} {categories}")
-        title_overlap = len(q & title_tokens) / len(q)
-        body_overlap = len(q & body_tokens) / len(q)
-        phrase_bonus = 0.35 if query.casefold() in f"{title} {description}".casefold() else 0.0
-        return round((title_overlap * 0.65) + (body_overlap * 0.35) + phrase_bonus, 4)
+        title_overlap = len(query_tokens & title_tokens) / len(query_tokens)
+        body_overlap = len(query_tokens & body_tokens) / len(query_tokens)
+        phrase_bonus = (
+            0.35
+            if query.casefold() in f"{title} {description}".casefold()
+            else 0.0
+        )
+        return round(
+            (title_overlap * 0.65) + (body_overlap * 0.35) + phrase_bonus,
+            4,
+        )
 
     @staticmethod
-    def _usable_image(ii: Dict[str, Any]) -> bool:
-        mime = (ii.get("mime") or "").casefold()
+    def _usable_image(image_info: Dict[str, Any]) -> bool:
+        mime = (image_info.get("mime") or "").casefold()
         if not mime.startswith("image/"):
             return False
         if mime in {"image/vnd.djvu", "image/x.djvu"}:
             return False
-        return bool(ii.get("url"))
+        return bool(image_info.get("url"))
 
     async def _commons_request(self, params: Dict[str, Any]):
-        # Wikimedia requires a meaningful User-Agent with contact information.
-        # Use the network request API directly so the generic client's random UA
-        # cannot replace this service-specific identity.
-        return await self.network.request(
-            "GET",
-            self.COMMONS_API,
-            params=params,
-            retries=2,
-            json_preferred=True,
-            extra_headers={
-                "User-Agent": self.COMMONS_USER_AGENT,
-                "Api-User-Agent": self.COMMONS_USER_AGENT,
-                "Accept": "application/json",
-                "Accept-Encoding": "gzip",
-            },
-            allow_404=False,
-        )
+        """Query Commons with deterministic transfer encoding and bounded retries.
+
+        The shared gateway deliberately requests identity encoding after observing
+        compressed upstream payloads that were not decoded reliably on Render.
+        Commons must not override that safety choice with gzip.
+        """
+        last_exception = None
+        combined_diagnostics = []
+
+        for attempt in range(2):
+            try:
+                response, diagnostics = await self.network.request(
+                    "GET",
+                    self.COMMONS_API,
+                    params=params,
+                    retries=3,
+                    json_preferred=True,
+                    extra_headers={
+                        "User-Agent": self.COMMONS_USER_AGENT,
+                        "Api-User-Agent": self.COMMONS_USER_AGENT,
+                        "Accept": "application/json",
+                        "Accept-Encoding": "identity",
+                    },
+                    allow_404=False,
+                    max_response_bytes=2_000_000,
+                )
+                combined_diagnostics.extend(diagnostics)
+                if response is not None and response.status_code == 200:
+                    return response, combined_diagnostics
+            except Exception as exc:
+                last_exception = exc
+                combined_diagnostics.append(
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+            if attempt == 0:
+                await asyncio.sleep(0.4)
+
+        if last_exception is not None:
+            raise last_exception
+        return None, combined_diagnostics
 
     async def search_commons(self, query: str, limit: int = 12):
         limit = max(1, min(int(limit), 30))
@@ -82,16 +116,25 @@ class MediaResearch:
                 "ok": False,
                 "query": query,
                 "results": [],
-                "error": {"code": "validation_failure", "message": "query cannot be empty", "retryable": False},
+                "error": {
+                    "code": "validation_failure",
+                    "message": "query cannot be empty",
+                    "retryable": False,
+                },
             }
 
-        # Search sequentially, following Wikimedia API etiquette. The variations
-        # improve recall while the local relevance filter removes books/PDFs and
-        # unrelated search noise.
-        variations = [query, f'"{query}"', f"{query} photograph"]
+        variations = [
+            query,
+            f'"{query}"',
+            f"{query} photograph",
+            " ".join(token for token in query.split() if token.casefold() not in {
+                "empty", "preferred", "visible", "no", "people"
+            }),
+        ]
         seen_variations = []
         for item in variations:
-            if item not in seen_variations:
+            item = re.sub(r"\s+", " ", item).strip()
+            if item and item not in seen_variations:
                 seen_variations.append(item)
 
         merged: Dict[int, Dict[str, Any]] = {}
@@ -110,25 +153,37 @@ class MediaResearch:
                 "format": "json",
                 "formatversion": 2,
                 "maxlag": 5,
-                "origin": "*",
             }
+
             try:
-                response, diag = await self._commons_request(params)
-                diagnostics.extend(str(d) for d in diag)
+                response, request_diagnostics = await self._commons_request(params)
+                diagnostics.extend(str(item) for item in request_diagnostics)
             except Exception as exc:
                 diagnostics.append(f"{type(exc).__name__}: {exc}")
                 continue
 
             if not response or response.status_code != 200:
                 continue
-            successful_requests += 1
 
             try:
                 data = response.json()
             except Exception as exc:
-                diagnostics.append(f"Invalid JSON: {type(exc).__name__}: {exc}")
+                diagnostics.append(
+                    f"Invalid JSON: {type(exc).__name__}: {exc}"
+                )
                 continue
 
+            api_error = data.get("error")
+            if api_error:
+                diagnostics.append(
+                    f"Commons API error {api_error.get('code')}: "
+                    f"{api_error.get('info', '')}"
+                )
+                if api_error.get("code") == "maxlag":
+                    await asyncio.sleep(0.6)
+                continue
+
+            successful_requests += 1
             pages = data.get("query", {}).get("pages", [])
             if isinstance(pages, dict):
                 pages = list(pages.values())
@@ -137,51 +192,73 @@ class MediaResearch:
                 pageid = page.get("pageid")
                 if pageid is None:
                     continue
-                ii = (page.get("imageinfo") or [{}])[0]
-                if not self._usable_image(ii):
+
+                image_info = (page.get("imageinfo") or [{}])[0]
+                if not self._usable_image(image_info):
                     continue
 
-                meta = ii.get("extmetadata", {})
-                description = self._metadata_value(meta, "ImageDescription")
-                categories = self._metadata_value(meta, "Categories")
+                metadata = image_info.get("extmetadata", {})
+                description = self._metadata_value(
+                    metadata, "ImageDescription"
+                )
+                categories = self._metadata_value(metadata, "Categories")
                 title = page.get("title") or ""
-                relevance = self._relevance_score(query, title, description, categories)
-
-                # Keep only candidates with at least meaningful token overlap.
+                relevance = self._relevance_score(
+                    query, title, description, categories
+                )
                 if relevance < 0.20:
                     continue
 
                 candidate = {
                     "title": title,
                     "pageid": pageid,
-                    "image_url": ii.get("url"),
-                    "description_url": ii.get("descriptionurl"),
-                    "mime": ii.get("mime"),
-                    "width": ii.get("width"),
-                    "height": ii.get("height"),
+                    "image_url": image_info.get("url"),
+                    "description_url": image_info.get("descriptionurl"),
+                    "mime": image_info.get("mime"),
+                    "width": image_info.get("width"),
+                    "height": image_info.get("height"),
                     "description": description,
-                    "author": self._metadata_value(meta, "Artist"),
-                    "license_short_name": self._metadata_value(meta, "LicenseShortName"),
-                    "license_url": self._metadata_value(meta, "LicenseUrl"),
-                    "usage_terms": self._metadata_value(meta, "UsageTerms"),
-                    "credit": self._metadata_value(meta, "Credit"),
-                    "attribution_required": self._metadata_value(meta, "AttributionRequired"),
-                    "restrictions": self._metadata_value(meta, "Restrictions"),
+                    "author": self._metadata_value(metadata, "Artist"),
+                    "license_short_name": self._metadata_value(
+                        metadata, "LicenseShortName"
+                    ),
+                    "license_url": self._metadata_value(
+                        metadata, "LicenseUrl"
+                    ),
+                    "usage_terms": self._metadata_value(
+                        metadata, "UsageTerms"
+                    ),
+                    "credit": self._metadata_value(metadata, "Credit"),
+                    "attribution_required": self._metadata_value(
+                        metadata, "AttributionRequired"
+                    ),
+                    "restrictions": self._metadata_value(
+                        metadata, "Restrictions"
+                    ),
                     "relevance_score": relevance,
                     "search_variation": search_query,
                 }
                 previous = merged.get(pageid)
-                if previous is None or relevance > previous["relevance_score"]:
+                if (
+                    previous is None
+                    or relevance > previous["relevance_score"]
+                ):
                     merged[pageid] = candidate
 
-            # Stop early once enough strong candidates exist.
-            strong = [item for item in merged.values() if item["relevance_score"] >= 0.55]
+            strong = [
+                item
+                for item in merged.values()
+                if item["relevance_score"] >= 0.55
+            ]
             if len(strong) >= limit:
                 break
 
         results = sorted(
             merged.values(),
-            key=lambda item: (item["relevance_score"], item.get("width") or 0),
+            key=lambda item: (
+                item["relevance_score"],
+                item.get("width") or 0,
+            ),
             reverse=True,
         )[:limit]
 
@@ -229,13 +306,19 @@ class MediaResearch:
                     "id": "manual-render",
                     "name": "Manual render workflow",
                     "live_search": False,
-                    "notes": "Use Blender, Roblox Studio, photography, or other non-AI manual creation.",
+                    "notes": (
+                        "Use Blender, Roblox Studio, photography, or other "
+                        "non-AI manual creation."
+                    ),
                 },
                 {
                     "id": "original-photo",
                     "name": "Original photography",
                     "live_search": False,
-                    "notes": "Check people, trademarks, private property, and local photography restrictions.",
+                    "notes": (
+                        "Check people, trademarks, private property, and local "
+                        "photography restrictions."
+                    ),
                 },
             ],
         }

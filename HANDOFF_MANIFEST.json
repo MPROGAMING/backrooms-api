@@ -1,0 +1,30 @@
+{
+  "package": "BackroomsGPT Codex Handoff — FINAL v21",
+  "canonical_candidate": "BackroomsGPT FINAL v21.0.0",
+  "build": "BACKROOMSGPT-FINAL-21",
+  "purpose": "Codex continuation and final production release handoff",
+  "source_of_truth": [
+    "verified production facts",
+    "current GitHub repository",
+    "current handoff runtime and documentation",
+    "current tests and evidence",
+    "attached conversation for historical intent",
+    "ARCHIVE only for history"
+  ],
+  "important_entrypoints": {
+    "agent_instructions": "AGENTS.md",
+    "start_here": "CODEX_START_HERE.md",
+    "current_status": "CONTEXT/CURRENT_STATUS.md",
+    "deployment": "CONTEXT/DEPLOYMENT_AND_CONFIG.md",
+    "release_gates": "CONTEXT/RELEASE_GATES.md",
+    "schema": "GPT_ACTIONS/openapi-actions-v21.json"
+  },
+  "release_counts": {
+    "routes": 53,
+    "actions": 33,
+    "knowledge_files": 20,
+    "local_tests": 44
+  },
+  "historical_material": "ARCHIVE/ is not canonical and is intentionally excluded from current runtime/deployment work.",
+  "production_status": "v21 code is locally validated; deployment and authorized production validation remain required."
+}

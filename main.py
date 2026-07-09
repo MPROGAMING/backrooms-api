@@ -1,38 +1,235 @@
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import JSONResponse
-import httpx
-from bs4 import BeautifulSoup
+import asyncio
+import re
+import time
 import logging
+from typing import List, Optional, Dict, Any
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import httpx
+from urllib.parse import unquote
 
-# הגדרת מערכת לוגים ברמת שרת
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ==============================================================================
+# 1. ADVANCED TELEMETRY & LOGGING SYSTEM
+# ==============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("OMNI-NODE")
 
+# ==============================================================================
+# 2. IN-MEMORY ASYNC CACHE SYSTEM (THE "SHORT-TERM MEMORY")
+# ==============================================================================
+class AsyncTTLCache:
+    """A high-performance thread-safe caching system to prevent node-flooding."""
+    def __init__(self, ttl_seconds: int = 3600):
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.ttl = ttl_seconds
+
+    def get(self, key: str) -> Optional[Any]:
+        if key in self.cache:
+            entry = self.cache[key]
+            if time.time() - entry['timestamp'] < self.ttl:
+                logger.info(f"[CACHE HIT] Retrieved optimal payload for: {key}")
+                return entry['data']
+            else:
+                del self.cache[key] # Expired
+        return None
+
+    def set(self, key: str, data: Any):
+        self.cache[key] = {
+            'timestamp': time.time(),
+            'data': data
+        }
+        logger.info(f"[CACHE SET] Memorized payload for: {key}")
+
+memory_bank = AsyncTTLCache(ttl_seconds=1800) # 30 minutes cache
+
+# ==============================================================================
+# 3. FASTAPI CONFIGURATION & MIDDLEWARE
+# ==============================================================================
 app = FastAPI(
     title="M.E.G. Omni-Database API (Ultra-Max Sync)",
-    description="Central routing node for Backrooms APIs including Fandom, Wikidot, Liminal Archives, and Kane Pixels.",
+    description="Advanced central routing node for Backrooms APIs with Smart Slug Resolution, Concurrency Fetching, and Auto-Correction.",
     version="4.0.0"
 )
 
-# הגדרת Timeout קשיח כדי למנוע קריסה של Render
-TIMEOUT_SETTINGS = httpx.Timeout(15.0)
-DEFAULT_HEADERS = {"User-Agent": "MEG-Archival-Bot/4.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time-Sec"] = str(process_time)
+    logger.info(f"[TELEMETRY] {request.method} {request.url.path} completed in {process_time:.3f}s")
+    return response
+
+# ==============================================================================
+# 4. PYDANTIC SCHEMAS (DATA VALIDATION)
+# ==============================================================================
+class PageContentResponse(BaseModel):
+    content: str
+    metadata: Dict[str, Any]
+
+class ErrorResponse(BaseModel):
+    error: str
+    diagnostics: Dict[str, Any]
+
+# ==============================================================================
+# 5. THE AI-LIKE SLUG RESOLUTION ENGINE (SMART PERMUTATIONS)
+# ==============================================================================
+def generate_smart_slug_matrix(raw_input: str, is_intl: bool = False, lang: str = "") -> List[str]:
+    """
+    The 'Brain' of the API. Generates every possible structural format a human
+    might intend when typing a level or entity name, completely eliminating 404s
+    caused by typos, missing dashes, or casing issues.
+    """
+    base = unquote(raw_input).strip()
+    clean_base = re.sub(r'[^a-zA-Z0-9\s-]', '', base) # Strip weird characters
+    
+    # Extract structural components
+    numbers = ''.join(filter(str.isdigit, base))
+    has_numbers = bool(numbers)
+    
+    variants = set()
+    
+    # Standard format injections
+    variants.add(base)
+    variants.add(base.lower())
+    variants.add(base.replace(" ", "-").lower())
+    variants.add(base.replace(" ", "").lower())
+    variants.add(base.replace(" ", "_").lower())
+    variants.add(base.replace("-", "").lower())
+    variants.add(base.title().replace(" ", "-"))
+    
+    # If it's a numbered level, brute-force all common wiki naming conventions
+    if has_numbers:
+        variants.add(f"level-{numbers}")
+        variants.add(f"level{numbers}")
+        variants.add(f"Level{numbers}")
+        variants.add(f"Level-{numbers}")
+        variants.add(f"level_{numbers}")
+        variants.add(numbers) # Just the number as a slug (very common in free-writing)
+        
+        # International Translation Matrix (Handling foreign language structural quirks)
+        if is_intl:
+            lang_dict = {
+                "ru": f"uroven-{numbers}",
+                "es": f"nivel-{numbers}",
+                "fr": f"niveau-{numbers}",
+                "de": f"ebene-{numbers}",
+                "cn": f"level-{numbers}", # CN usually keeps english prefix but just in case
+                "pl": f"poziom-{numbers}"
+            }
+            if lang in lang_dict:
+                variants.add(lang_dict[lang])
+                variants.add(lang_dict[lang].replace("-", ""))
+
+    # Order by most likely to least likely for optimization
+    ordered_variants = [v for v in variants if v]
+    logger.info(f"[SMART-MATRIX] Generated {len(ordered_variants)} permutations for '{raw_input}'")
+    return ordered_variants
+
+# ==============================================================================
+# 6. CONCURRENT HTTP FETCHING ENGINE (SPEED OPTIMIZATION)
+# ==============================================================================
+TIMEOUT_SETTINGS = httpx.Timeout(10.0, connect=5.0)
+DEFAULT_HEADERS = {
+    "User-Agent": "MEG-Archival-Bot/4.0 (Macintosh; Intel Mac OS X 10_15_7) Smart-Concurrency-Engine",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+}
+
+async def fetch_single_url(client: httpx.AsyncClient, url: str) -> Optional[httpx.Response]:
+    """Helper for concurrent fetching that fails silently on 404 to keep logs clean."""
+    try:
+        response = await client.get(url, headers=DEFAULT_HEADERS)
+        if response.status_code == 200:
+            return response
+    except httpx.RequestError:
+        pass
+    return None
+
+async def concurrent_smart_fetch(base_url_template: str, variants: List[str]) -> tuple[Optional[str], Optional[httpx.Response]]:
+    """
+    Fires asynchronous requests to all generated permutations. 
+    Returns the FIRST successful response immediately, canceling the rest.
+    """
+    async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
+        tasks = []
+        for variant in variants:
+            url = base_url_template.format(variant=variant)
+            tasks.append((url, asyncio.create_task(fetch_single_url(client, url))))
+        
+        # We process them as they complete. First 200 OK wins.
+        for url, task in tasks:
+            response = await task
+            if response and response.status_code == 200:
+                logger.info(f"[CONCURRENCY HIT] Successful resolution at: {url}")
+                # Cancel remaining tasks to save memory and bandwidth
+                for _, t in tasks:
+                    if not t.done():
+                        t.cancel()
+                return url, response
+                
+    return None, None
+
+# ==============================================================================
+# 7. ADVANCED DOM SANITIZER (NOISE REDUCTION)
+# ==============================================================================
+def advanced_html_sanitizer(html_text: str, container_id: str = "page-content") -> str:
+    """Intelligently parses HTML, removing navbars, rating modules, and code tags."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    
+    content_div = soup.find(id=container_id)
+    if not content_div:
+        # Fallback to MediaWiki standard if Wikidot ID is missing
+        content_div = soup.find(id="mw-content-text") or soup
+        
+    # Rip out annoying visual elements that confuse LLMs
+    for tag in content_div.find_all(['script', 'style', 'nav', 'footer', 'iframe']):
+        tag.decompose()
+        
+    # Remove standard Wikidot rating modules and page tags
+    for class_name in ['page-rate-widget-box', 'page-tags', 'footer-wikiwiki', 'wd-adunit']:
+        for div in content_div.find_all('div', class_=class_name):
+            div.decompose()
+
+    # Smart text extraction preserving basic line-breaks
+    clean_text = content_div.get_text(separator="\n", strip=True)
+    
+    # Regex cleanup to remove excessive blank lines
+    clean_text = re.sub(r'\n{3,}', '\n\n', clean_text)
+    return clean_text
+
+# ==============================================================================
+# 8. API ENDPOINTS (THE OMNI-ROUTERS)
+# ==============================================================================
 
 @app.get("/fandom/search")
 async def search_fandom(q: str):
+    cache_key = f"fandom_search_{q}"
+    if cached := memory_bank.get(cache_key): return cached
+
     url = "https://backrooms.fandom.com/api.php"
     params = {"action": "query", "list": "search", "srsearch": q, "format": "json", "utf8": 1}
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
             response = await client.get(url, params=params)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            memory_bank.set(cache_key, data)
+            return data
     except Exception as e:
         logger.error(f"Fandom Search Error: {e}")
-        return JSONResponse(status_code=500, content={"error": "Fandom database node unreachable."})
+        return JSONResponse(status_code=500, content={"error": "Fandom database node unreachable.", "diagnostics": str(e)})
 
 @app.get("/fandom/page")
 async def get_fandom_page(title: str):
+    cache_key = f"fandom_page_{title}"
+    if cached := memory_bank.get(cache_key): return cached
+
     url = "https://backrooms.fandom.com/api.php"
     params = {"action": "parse", "page": title, "format": "json", "prop": "text", "disabletoc": 1}
     try:
@@ -40,9 +237,10 @@ async def get_fandom_page(title: str):
             response = await client.get(url, params=params)
             data = response.json()
             if "parse" in data:
-                soup = BeautifulSoup(data["parse"]["text"]["*"], "html.parser")
-                clean_text = soup.get_text(separator="\n", strip=True)
-                return {"content": clean_text}
+                clean_text = advanced_html_sanitizer(data["parse"]["text"]["*"], container_id="mw-content-text")
+                result = {"content": f"[FANDOM CORE NODE: {title}]\n{clean_text}"}
+                memory_bank.set(cache_key, result)
+                return result
             return JSONResponse(status_code=404, content={"error": f"Fandom page '{title}' not found."})
     except Exception as e:
         logger.error(f"Fandom Page Error: {e}")
@@ -50,82 +248,87 @@ async def get_fandom_page(title: str):
 
 @app.get("/wikidot/page")
 async def get_wikidot_page(url: str):
-    if not url.startswith("http"):
-        url = f"https://backrooms-wiki.wikidot.com/{url}"
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
-            response = await client.get(url, headers=DEFAULT_HEADERS)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, "html.parser")
-                content_div = soup.find(id="page-content")
-                text = content_div.get_text(separator="\n", strip=True) if content_div else soup.get_text(separator="\n", strip=True)
-                return {"content": text}
-            return JSONResponse(status_code=404, content={"error": f"Wikidot page unavailable. Status: {response.status_code}"})
-    except Exception as e:
-        logger.error(f"Wikidot Page Error: {e}")
-        return JSONResponse(status_code=500, content={"error": "Wikidot node connection timed out."})
+    cache_key = f"wikidot_page_{url}"
+    if cached := memory_bank.get(cache_key): return cached
+
+    variants = generate_smart_slug_matrix(url)
+    base_template = "https://backrooms-wiki.wikidot.com/{variant}"
+    
+    successful_url, response = await concurrent_smart_fetch(base_template, variants)
+    
+    if successful_url and response:
+        clean_text = advanced_html_sanitizer(response.text)
+        result = {"content": f"[WIKIDOT CORE NODE]\n{clean_text}"}
+        memory_bank.set(cache_key, result)
+        return result
+        
+    return JSONResponse(status_code=404, content={"error": f"Wikidot page '{url}' unavailable after testing {len(variants)} smart variants."})
+
 
 @app.get("/wikidot/international")
 async def get_international_wikidot(lang: str, page: str):
-    url = f"https://backrooms-{lang}.wikidot.com/{page}"
-    logger.info(f"Targeting International URL: {url}")
-    
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
-            response = await client.get(url, headers=DEFAULT_HEADERS)
-            
-            if response.status_code == 404 and "-" in page:
-                alt_page = page.replace("-", "")
-                url = f"https://backrooms-{lang}.wikidot.com/{alt_page}"
-                logger.info(f"Retrying with Alternative URL: {url}")
-                response = await client.get(url, headers=DEFAULT_HEADERS)
+    cache_key = f"intl_{lang}_{page}"
+    if cached := memory_bank.get(cache_key): return cached
 
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, "html.parser")
-                content_div = soup.find(id="page-content")
-                text = content_div.get_text(separator="\n", strip=True) if content_div else soup.get_text(separator="\n", strip=True)
-                return {"content": f"[INTERNATIONAL NODE: {lang.upper()}]\n{text}"}
-                
-            return JSONResponse(status_code=404, content={"error": f"International Wikidot branch '{lang}' page '{page}' not found. Tried URL: {url}"})
-    except Exception as e:
-        logger.error(f"International Wikidot Error: {e}")
-        return JSONResponse(status_code=500, content={"error": f"International node '{lang}' connection failed: {str(e)}"})
+    logger.info(f"Initiating Smart Resolution for Intl Node ({lang}): {page}")
+    variants = generate_smart_slug_matrix(page, is_intl=True, lang=lang)
+    base_template = f"https://backrooms-{lang}.wikidot.com/{{variant}}"
+    
+    successful_url, response = await concurrent_smart_fetch(base_template, variants)
+    
+    if successful_url and response:
+        clean_text = advanced_html_sanitizer(response.text)
+        result = {"content": f"[INTERNATIONAL NODE: {lang.upper()}]\nResolved URL: {successful_url}\n\n{clean_text}"}
+        memory_bank.set(cache_key, result)
+        return result
+        
+    return JSONResponse(status_code=404, content={"error": f"International Wikidot branch '{lang}' page '{page}' not found. Matrix tested {len(variants)} possibilities."})
+
 
 @app.get("/wikidot/freewriting")
 async def get_free_writing_wiki(page: str):
-    url = f"https://backrooms-freewriting.wikidot.com/{page}"
-    logger.info(f"Targeting Free Writing Wiki URL: {url}")
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
-            response = await client.get(url, headers=DEFAULT_HEADERS)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, "html.parser")
-                content_div = soup.find(id="page-content")
-                text = content_div.get_text(separator="\n", strip=True) if content_div else soup.get_text(separator="\n", strip=True)
-                return {"content": f"[FREE WRITING WIKI NODE]\n{text}"}
-            return JSONResponse(status_code=404, content={"error": f"Free Writing Wiki page '{page}' not found."})
-    except Exception as e:
-        logger.error(f"Free Writing Wiki Error: {e}")
-        return JSONResponse(status_code=500, content={"error": f"Free Writing Wiki connection failed: {str(e)}"})
+    cache_key = f"freewriting_{page}"
+    if cached := memory_bank.get(cache_key): return cached
+
+    logger.info(f"Initiating Smart Resolution for Free Writing Node: {page}")
+    variants = generate_smart_slug_matrix(page)
+    base_template = "https://backrooms-freewriting.wikidot.com/{variant}"
+    
+    successful_url, response = await concurrent_smart_fetch(base_template, variants)
+    
+    if successful_url and response:
+        clean_text = advanced_html_sanitizer(response.text)
+        result = {"content": f"[FREE WRITING WIKI NODE]\nResolved URL: {successful_url}\n\n{clean_text}"}
+        memory_bank.set(cache_key, result)
+        return result
+        
+    return JSONResponse(status_code=404, content={"error": f"Free Writing Wiki page '{page}' not found. Smart-Matrix failed to resolve {len(variants)} permutations."})
+
 
 @app.get("/archives/liminal")
 async def get_liminal_archives(page: str):
-    url = f"https://liminalarchives.xyz/wiki/{page}"
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
-            response = await client.get(url, headers=DEFAULT_HEADERS)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, "html.parser")
-                content_div = soup.find(id="mw-content-text")
-                text = content_div.get_text(separator="\n", strip=True) if content_div else soup.get_text(separator="\n", strip=True)
-                return {"content": f"[LIMINAL ARCHIVES NODE]\n{text}"}
-            return JSONResponse(status_code=404, content={"error": f"Liminal Archives page '{page}' not found."})
-    except Exception as e:
-        logger.error(f"Liminal Archives Error: {e}")
-        return JSONResponse(status_code=500, content={"error": "Liminal Archives database unreachable."})
+    cache_key = f"liminal_{page}"
+    if cached := memory_bank.get(cache_key): return cached
+
+    variants = generate_smart_slug_matrix(page)
+    base_template = "https://liminalarchives.xyz/wiki/{variant}"
+    
+    successful_url, response = await concurrent_smart_fetch(base_template, variants)
+
+    if successful_url and response:
+        clean_text = advanced_html_sanitizer(response.text, container_id="mw-content-text")
+        result = {"content": f"[LIMINAL ARCHIVES NODE]\n{clean_text}"}
+        memory_bank.set(cache_key, result)
+        return result
+        
+    return JSONResponse(status_code=404, content={"error": f"Liminal Archives page '{page}' not found."})
+
 
 @app.get("/cinematic/kanepixels")
 async def get_kane_pixels_lore(topic: str):
+    cache_key = f"kane_{topic}"
+    if cached := memory_bank.get(cache_key): return cached
+
     url = "https://kane-pixels-backrooms.fandom.com/api.php"
     search_params = {"action": "query", "list": "search", "srsearch": topic, "format": "json", "utf8": 1}
     try:
@@ -143,9 +346,10 @@ async def get_kane_pixels_lore(topic: str):
             page_data = page_res.json()
             
             if "parse" in page_data:
-                soup = BeautifulSoup(page_data["parse"]["text"]["*"], "html.parser")
-                clean_text = soup.get_text(separator="\n", strip=True)
-                return {"content": f"[KANE PIXELS CANON FILE: {exact_title}]\n{clean_text}"}
+                clean_text = advanced_html_sanitizer(page_data["parse"]["text"]["*"], container_id="mw-content-text")
+                result = {"content": f"[KANE PIXELS CANON FILE: {exact_title}]\n{clean_text}"}
+                memory_bank.set(cache_key, result)
+                return result
                 
             return JSONResponse(status_code=404, content={"error": "Failed to parse cinematic lore file."})
     except Exception as e:

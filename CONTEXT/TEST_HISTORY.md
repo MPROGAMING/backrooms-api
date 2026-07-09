@@ -71,21 +71,36 @@ Added:
 - relevance ranking;
 - query variants.
 
-## Post-hotfix local validation
+## v21 final local validation
 
-Latest local command result:
+Latest command result from the clean Python 3.12 environment:
 
 ```text
-......
 ----------------------------------------------------------------------
-Ran 6 tests in 0.035s
+Ran 44 tests
 
 OK
-SMOKE PASS 20.0.0 52 routes
+SMOKE PASS 21.0.0 53 routes
 ```
 
-## Required next test
+The added retrieval regression confirms that a cached upstream failure remains
+`SourceUnavailable` and cannot be reclassified as `PageNotFound`.
 
-Full production Preview after deployment.
+## v21 production validation snapshot
 
-Do not mark final release clean until the production-focused acceptance checks pass.
+Verified:
+
+- Render serves `21.0.0` / `BACKROOMSGPT-FINAL-21`.
+- `/health`, `/openapi.json`, `/privacy`, and Atlas read routes respond.
+- Unauthenticated protected writes fail closed with `503` while the secret is
+  absent.
+
+Not yet verified:
+
+- durable Render storage;
+- authorized ingest and repeat/idempotency behavior;
+- production acceptance evals;
+- a live Baby Food fetch during the current Liminal upstream outage.
+
+Do not mark the final release clean until the owner configures the missing
+Render resources and the production-focused acceptance checks pass.

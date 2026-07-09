@@ -26,5 +26,5 @@
     "local_tests": 44
   },
   "historical_material": "ARCHIVE/ is not canonical and is intentionally excluded from current runtime/deployment work.",
-  "production_status": "v21 code is locally validated; deployment and authorized production validation remain required."
+  "production_status": "v21 runtime is deployed and smoke-verified; durable storage, Action authentication, and authorized production write/eval validation remain required."
 }

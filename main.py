@@ -82,32 +82,35 @@ class ErrorResponse(BaseModel):
 # ==============================================================================
 def generate_smart_slug_matrix(raw_input: str, is_intl: bool = False, lang: str = "") -> List[str]:
     """
-    The Optimized 'Brain' of the API. Collapses multiple dashes, spaces, 
-    and handles uniform slug parsing to ensure 100% resolution accuracy.
+    The Ultimate Permutation Engine. Preserves colons, handles casing dynamically,
+    collapses multi-dashes, and guarantees accurate structural matching.
     """
-    # 1. ניקוי ראשוני והסרת תווים לא חוקיים ב-URL
     base = unquote(raw_input).strip()
     
-    # 2. הפיכת רווחים למקפים, והפיכת אותיות לקטנות לצורך אחידות
-    normalized = base.replace(" ", "-").lower()
+    # 1. יצירת וריאציה נקייה ששומרת על האותיות המקוריות (Case Preserved)
+    preserved = base.replace(" ", "-")
+    preserved = re.sub(r'-{2,}', '-', preserved)
+    preserved = re.sub(r'[^a-zA-Z0-9:-]', '', preserved) # שומר גם על נקודתיים!
     
-    # 3. חוק הברזל: הפיכת רצף של מקפים (כמו ---) למקף בודד אחד (-)
-    normalized = re.sub(r'-{2,}', '-', normalized)
+    # 2. יצירת וריאציה נקייה באותיות קטנות (Case Lowered)
+    lowered = preserved.lower()
     
-    # 4. ניקוי שאריות של תווים מוזרים
-    clean_base = re.sub(r'[^a-zA-Z0-9-]', '', normalized)
-    
-    # חילוץ המספרים מהקלט (אם יש)
+    # חילוץ מספרים
     numbers = ''.join(filter(str.isdigit, base))
     has_numbers = bool(numbers)
     
     variants = set()
     
-    # הזרקת הוריאציות הנקיות באמת למטריצה
-    variants.add(clean_base)                               # למשל: level-0
-    variants.add(clean_base.replace("-", ""))              # בלי מקף בכלל: level0
-    variants.add(clean_base.replace("-", "").capitalize()) # אות גדולה בלי מקף: Level0
+    # הוספת הזרמים הראשיים (הנקיים באמת)
+    variants.add(preserved)                           # הגרסה המקורית הנקייה (למשל: Level-728)
+    variants.add(lowered)                             # הגרסה הקטנה הנקייה (למשל: level-728)
+    variants.add(lowered.replace("-", ""))            # מחובר קטן (level728)
+    variants.add(preserved.replace("-", ""))           # מחובר מקורי (Level728)
+    variants.add(lowered.replace("system-", "system:")) # תיקון אוטומטי של מקף לנקודתיים של מערכת
+    variants.add(preserved.replace("system-", "system:"))
+    variants.add(base)                                # הגלם המוחלט ליתר ביטחון
     
+    # אם יש מספרים, נכסה את כל תיקיות הליבה של ויקידוט
     if has_numbers:
         variants.add(f"level-{numbers}")
         variants.add(f"level{numbers}")
@@ -126,14 +129,12 @@ def generate_smart_slug_matrix(raw_input: str, is_intl: bool = False, lang: str 
                 variants.add(lang_dict[lang])
                 variants.add(lang_dict[lang].replace("-", ""))
 
-    # הוספת גרסה באותיות גדולות למקרה של אותיות כמו 'N' או 'N-1'
+    # טיפול באותיות קצרות (כמו Level N)
     variants.add(base.upper())
     variants.add(base.lower())
-    if "-" in base:
-        variants.add(base.split("-")[0].lower() + "-" + "".join(base.split("-")[1:]).upper())
 
-    ordered_variants = [v for v in variants if v]
-    logger.info(f"[SMART-MATRIX V2] Permutations compiled: {ordered_variants}")
+    ordered_variants = list(dict.fromkeys([v for v in variants if v]))
+    logger.info(f"[SMART-MATRIX V4.2] Compiled variants: {ordered_variants}")
     return ordered_variants
 
 # ==============================================================================

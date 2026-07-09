@@ -2320,6 +2320,7 @@ class WikidotAdapter(BaseAdapter):
         """
         all_diagnostics: List[dict] = []
         reachable = False
+        unavailable_candidate = False
 
         # Preserve slug/base priority. Racing every candidate allowed the fastest
         # page to win, even when it was not the intended canonical slug, and
@@ -2333,6 +2334,7 @@ class WikidotAdapter(BaseAdapter):
                 )
                 all_diagnostics.extend(asdict(d) for d in diagnostics)
             except Exception as exc:
+                unavailable_candidate = True
                 all_diagnostics.append(
                     {
                         "url": url,
@@ -2361,7 +2363,11 @@ class WikidotAdapter(BaseAdapter):
                     continue
                 return response, str(response.url), all_diagnostics, reachable
 
-        return None, None, all_diagnostics, reachable
+        # A 404 from one alias is not sufficient evidence that a page is absent
+        # when another configured live candidate failed at the transport layer.
+        # Require every attempted candidate to be reachable before callers may
+        # classify the result as PageNotFound; otherwise preserve 503 semantics.
+        return None, None, all_diagnostics, reachable and not unavailable_candidate
 
     def _page_urls(self, page: str) -> List[str]:
         slugs = generate_slug_candidates(page, language=self.source.language)

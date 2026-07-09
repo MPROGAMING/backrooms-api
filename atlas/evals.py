@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import re
 from urllib.parse import unquote, urlparse
 
@@ -22,6 +24,10 @@ def _hit_matches_query(hit, query: str) -> bool:
     title_key = _key(getattr(hit, "title", ""))
     path_key = _key(urlparse(getattr(hit, "url", "")).path.strip("/"))
     return target == title_key or target == path_key
+
+
+def _page_matches_query(page, query: str) -> bool:
+    return _hit_matches_query(page, query)
 
 
 class EvalSuite:
@@ -93,11 +99,13 @@ class EvalSuite:
                     "Level 0",
                     source_ids=["wikidot-main", "fandom-main"],
                 )
+                records = {record.get("source_id"): record for record in cmp.get("records", [])}
                 ok = (
                     cmp.get("meta", {}).get("payload_mode") == "compact-comparison"
-                    and len(cmp.get("records", [])) == 2
+                    and records.get("wikidot-main", {}).get("ok") is True
+                    and records.get("fandom-main", {}).get("ok") is True
                 )
-                add("compact_canon_compare", ok, cmp.get("meta", {}))
+                add("compact_canon_compare", ok, {"meta": cmp.get("meta", {}), "records": records})
             except Exception as exc:
                 add("compact_canon_compare", False, f"{type(exc).__name__}: {exc}")
 
@@ -109,17 +117,17 @@ class EvalSuite:
                         max_chars=10000,
                         allow_archive_fallback=True,
                     )
-                    title = page.title
+                    exact = _page_matches_query(page, "Level 0")
                     add(
                         "reject_wrong_liminal_archive_match",
-                        not ("10.1" in title or "corn maze" in title.casefold()),
-                        title,
+                        exact,
+                        {"title": page.title, "url": page.url, "archived": bool(page.archived)},
                     )
                 except Exception as exc:
                     add(
                         "reject_wrong_liminal_archive_match",
-                        True,
-                        f"correctly no unsafe match: {type(exc).__name__}",
+                        type(exc).__name__ == "PageNotFound",
+                        f"{type(exc).__name__}: {exc}",
                     )
             except Exception as exc:
                 add(
@@ -128,7 +136,8 @@ class EvalSuite:
                     f"{type(exc).__name__}: {exc}",
                 )
 
-        run = self.store.save_eval(
+        run = await asyncio.to_thread(
+            self.store.save_eval,
             "acceptance-live" if live else "acceptance-local",
             results,
         )

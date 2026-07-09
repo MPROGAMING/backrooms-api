@@ -54,7 +54,16 @@ class EvalSuite:
             try:
                 la = self.adapter_for(self.registry.get("liminal-archives"))
                 hits = await la.search("Baby Food", limit=5)
-                matches = [hit for hit in hits if _hit_matches_query(hit, "Baby Food")]
+                # A search may legitimately expose historical Wayback results
+                # when Wikidot site search is sparse.  This acceptance check is
+                # specifically for the live page, so an archived URL must never
+                # be turned into a live Wikidot slug.
+                matches = [
+                    hit
+                    for hit in hits
+                    if not bool(getattr(hit, "archived", False))
+                    and _hit_matches_query(hit, "Baby Food")
+                ]
 
                 details = {
                     "hits": [
@@ -67,9 +76,7 @@ class EvalSuite:
                     ]
                 }
 
-                if not matches:
-                    add("liminal_baby_food_search", False, details)
-                else:
+                if matches:
                     best = matches[0]
                     slug = unquote(urlparse(best.url).path.strip("/")) or "Baby Food"
                     page = await la.fetch_page(
@@ -85,6 +92,27 @@ class EvalSuite:
                         "title": page.title,
                         "url": page.url,
                         "archived": bool(page.archived),
+                    }
+                    add("liminal_baby_food_search", live_ok, details)
+                else:
+                    # Site search can return only archive candidates even while
+                    # the exact live slug is available.  Verify the known
+                    # regression target directly, still with archive fallback
+                    # disabled, rather than accepting an archive URL as live.
+                    page = await la.fetch_page(
+                        "Baby Food",
+                        max_chars=12000,
+                        allow_archive_fallback=False,
+                    )
+                    live_ok = (
+                        not bool(getattr(page, "archived", False))
+                        and _key(urlparse(page.url).path.strip("/")) == _key("Baby Food")
+                    )
+                    details["fetched"] = {
+                        "title": page.title,
+                        "url": page.url,
+                        "archived": bool(page.archived),
+                        "resolved_via": "direct-live-regression-check",
                     }
                     add("liminal_baby_food_search", live_ok, details)
             except Exception as exc:

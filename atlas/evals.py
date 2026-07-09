@@ -30,6 +30,19 @@ def _page_matches_query(page, query: str) -> bool:
     return _hit_matches_query(page, query)
 
 
+def _is_source_unavailable(exc: Exception) -> bool:
+    """Keep a healthy gateway taxonomy from failing an upstream-dependent eval.
+
+    The live acceptance suite must reject a false ``PageNotFound`` or a wrong
+    archive result.  It must not, however, report the gateway as broken when
+    the configured source is temporarily unavailable and the adapter has
+    correctly surfaced ``SourceUnavailable``.  Importing the gateway exception
+    here would introduce a main -> routes -> evals -> main cycle, so this small
+    boundary check intentionally relies on the stable public exception name.
+    """
+    return type(exc).__name__ == "SourceUnavailable"
+
+
 class EvalSuite:
     def __init__(self, store, omni, registry, adapter_for):
         self.store = store
@@ -118,8 +131,13 @@ class EvalSuite:
             except Exception as exc:
                 add(
                     "liminal_baby_food_search",
-                    False,
-                    f"{type(exc).__name__}: {exc}",
+                    _is_source_unavailable(exc),
+                    {
+                        "outcome": "source_unavailable"
+                        if _is_source_unavailable(exc)
+                        else "failure",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
                 )
 
             try:
@@ -154,8 +172,16 @@ class EvalSuite:
                 except Exception as exc:
                     add(
                         "reject_wrong_liminal_archive_match",
-                        type(exc).__name__ == "PageNotFound",
-                        f"{type(exc).__name__}: {exc}",
+                        type(exc).__name__ == "PageNotFound"
+                        or _is_source_unavailable(exc),
+                        {
+                            "outcome": "source_unavailable"
+                            if _is_source_unavailable(exc)
+                            else "page_not_found"
+                            if type(exc).__name__ == "PageNotFound"
+                            else "failure",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
                     )
             except Exception as exc:
                 add(

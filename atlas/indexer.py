@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio, hashlib, json
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from .common import feature_hash_vector, now_iso, title_key
 
 class AtlasIndexer:
@@ -8,15 +8,21 @@ class AtlasIndexer:
         self.store=store;self.omni=omni;self.registry=registry;self.adapter_for=adapter_for
     def _doc_from_page(self,page:dict):
         source_id=page.get('source_id') or page.get('provenance',{}).get('source_id') or 'unknown'
-        text=page.get('text',''); title=page.get('title','Untitled'); url=page.get('url','')
+        text=(page.get('text','') or '')[:120000]; title=(page.get('title','Untitled') or 'Untitled')[:500]; url=self._canonical_url(page.get('url',''))
         content_hash=hashlib.sha256(text.encode('utf-8',errors='ignore')).hexdigest()
         doc_id=hashlib.sha256(f'{source_id}|{url or title}'.encode()).hexdigest()[:32]
         analysis=page.get('analysis',{})
         return {'doc_id':doc_id,'source_id':source_id,'canon':page.get('canon') or page.get('provenance',{}).get('canon'),'title':title,'url':url,'language':page.get('language','en'),'text':text,'summary':analysis.get('summary',''),'content_hash':content_hash,'vector':feature_hash_vector(title+'\n'+analysis.get('summary','')+'\n'+text[:60000]),'metadata':{'analysis':analysis,'links':page.get('links',[]),'image_urls':page.get('image_urls',[]),'provenance':page.get('provenance',{}),'resolved_via':page.get('resolved_via')},'archived':page.get('archived',False),'fetched_at':page.get('retrieved_at',now_iso())}
+
+    @staticmethod
+    def _canonical_url(value):
+        parsed=urlparse(value or '')
+        if not parsed.scheme or not parsed.netloc:return value or ''
+        return urlunparse((parsed.scheme,parsed.netloc,parsed.path,'','',''))
     def _edges(self,doc,page):
         out=[]
         for link in page.get('links',[])[:300]:
-            url=link.get('url',''); title=link.get('title') or url.rsplit('/',1)[-1]
+            url=self._canonical_url(link.get('url','')); title=(link.get('title') or url.rsplit('/',1)[-1])[:500]
             key=hashlib.sha256(f"{doc['source_id']}|{url or title}".encode()).hexdigest()[:32]
             out.append({'source_id':doc['source_id'],'to_key':key,'to_title':title,'to_url':url,'relation':'links_to','confidence':1.0})
         signals=page.get('analysis',{}).get('named_signals',{})
@@ -30,14 +36,18 @@ class AtlasIndexer:
         edges = self._edges(doc, page)
         self.store.upsert_document_with_edges(doc, edges, snapshot=True)
         return doc
-    async def ingest(self,query:str,scope:str='core',source_ids=None):
-        result=await self.omni.resolve_and_fetch(query,scope=scope,source_ids=source_ids,allow_archive_fallback=True)
-        doc=self.index_page_payload(result['page'])
-        return {'ok':True,'query':query,'indexed':{k:doc[k] for k in ['doc_id','source_id','canon','title','url','content_hash']},'alternatives':result.get('alternatives',[])[:5]}
-    async def ingest_source_page(self,source_id:str,page:str):
-        source=self.registry.get(source_id); payload=(await self.adapter_for(source).fetch_page(page,max_chars=160000,allow_archive_fallback=True)).to_dict(); doc=self.index_page_payload(payload)
-        return {'ok':True,'indexed':{k:doc[k] for k in ['doc_id','source_id','canon','title','url','content_hash']}}
+    async def ingest(self,query:str,scope:str='core',source_ids=None,allow_archive_fallback:bool=False):
+        query=(query or '').strip()
+        if not query or len(query)>500: raise ValueError('query must contain 1-500 characters')
+        result=await self.omni.resolve_and_fetch(query,scope=scope,source_ids=source_ids,allow_archive_fallback=allow_archive_fallback)
+        doc=await asyncio.to_thread(self.index_page_payload,result['page'])
+        return {'ok':True,'query':query,'indexed':{k:doc[k] for k in ['doc_id','source_id','canon','title','url','content_hash','archived']},'alternatives':result.get('alternatives',[])[:5]}
+    async def ingest_source_page(self,source_id:str,page:str,allow_archive_fallback:bool=False):
+        if not (page or '').strip() or len(page)>500: raise ValueError('page must contain 1-500 characters')
+        source=self.registry.get(source_id); payload=(await self.adapter_for(source).fetch_page(page,max_chars=120000,allow_archive_fallback=allow_archive_fallback)).to_dict(); doc=await asyncio.to_thread(self.index_page_payload,payload)
+        return {'ok':True,'indexed':{k:doc[k] for k in ['doc_id','source_id','canon','title','url','content_hash','archived']}}
     async def sync_recent(self,scope:str='core',per_source_limit:int=5,total_limit:int=25):
+        per_source_limit=max(1,min(int(per_source_limit),10)); total_limit=max(1,min(int(total_limit),50))
         recent=await self.omni.recent_across_sources(scope=scope,per_source_limit=per_source_limit,total_limit=total_limit)
         hits=recent.get('results',[]); sem=asyncio.Semaphore(6); results=[]
         async def one(hit):

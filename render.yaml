@@ -1,0 +1,31 @@
+# Copy this file to the ROOT of MPROGAMING/backrooms-api before using it as a
+# Render Blueprint. The SERVER/ directory exists only in the Codex handoff.
+services:
+  - type: web
+    name: backrooms-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    disk:
+      name: backroomsgpt-atlas-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: ATLAS_DATA_DIR
+        value: /var/data/backroomsgpt-atlas
+      - key: ATLAS_PERSISTENCE_MODE
+        value: durable
+      - key: ATLAS_REQUIRE_DURABLE_PROJECT_STORAGE
+        value: "true"
+      - key: ATLAS_PROJECT_RETENTION_DAYS
+        value: "30"
+      - key: ACTION_DEFAULT_MAX_TEXT_CHARS
+        value: "24000"
+      - key: ACTION_ABSOLUTE_MAX_TEXT_CHARS
+        value: "60000"
+      - key: MAX_REQUEST_BODY_BYTES
+        value: "262144"
+      - key: BACKROOMSGPT_ACTION_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.12.8

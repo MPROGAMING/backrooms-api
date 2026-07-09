@@ -67,20 +67,32 @@ async def get_wikidot_page(url: str):
 
 @app.get("/wikidot/international")
 async def get_international_wikidot(lang: str, page: str):
+    # ניסיון ראשון: עם מקף (הסטנדרט)
     url = f"https://backrooms-{lang}.wikidot.com/{page}"
+    logger.info(f"Targeting International URL: {url}")
+    
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_SETTINGS) as client:
             response = await client.get(url, headers=DEFAULT_HEADERS)
+            
+            # אם לא נמצא, ננסה אוטומטית פורמט חלופי בלי מקף (נפוץ מאוד בשרתים בינלאומיים)
+            if response.status_code == 404 and "-" in page:
+                alt_page = page.replace("-", "")
+                url = f"https://backrooms-{lang}.wikidot.com/{alt_page}"
+                logger.info(f"Retrying with Alternative URL: {url}")
+                response = await client.get(url, headers=DEFAULT_HEADERS)
+
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, "html.parser")
                 content_div = soup.find(id="page-content")
                 text = content_div.get_text(separator="\n", strip=True) if content_div else soup.get_text(separator="\n", strip=True)
                 return {"content": f"[INTERNATIONAL NODE: {lang.upper()}]\n{text}"}
-            return JSONResponse(status_code=404, content={"error": f"International Wikidot branch '{lang}' page '{page}' not found."})
+                
+            return JSONResponse(status_code=404, content={"error": f"International Wikidot branch '{lang}' page '{page}' not found. Tried URL: {url}"})
     except Exception as e:
         logger.error(f"International Wikidot Error: {e}")
-        return JSONResponse(status_code=500, content={"error": f"International node '{lang}' connection failed."})
-
+        return JSONResponse(status_code=500, content={"error": f"International node '{lang}' connection failed: {str(e)}"})
+        
 @app.get("/archives/liminal")
 async def get_liminal_archives(page: str):
     url = f"https://liminalarchives.xyz/wiki/{page}"

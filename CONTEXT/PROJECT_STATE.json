@@ -13,10 +13,13 @@
     "smoke": "PASS 21.0.0 53 routes",
     "python": "3.12.13"
   },
-  "production_baseline_before_v21": {
-    "version": "20.0.0",
-    "build": "ATLAS-OMNI-V20",
-    "v21_deployed": false
+  "production_state": {
+    "version": "21.0.0",
+    "build": "BACKROOMSGPT-FINAL-21",
+    "runtime_deployed": true,
+    "storage_mode": "ephemeral",
+    "protected_writes": "disabled_until_action_api_key_configured",
+    "liminal_upstream": "intermittently_unavailable"
   },
   "production_retest_required": true,
   "required_external_configuration": [

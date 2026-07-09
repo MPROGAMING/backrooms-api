@@ -14,7 +14,7 @@ class KnowledgeGraph:
             node,path=q.popleft()
             if node==target_doc_id:return {'ok':True,'path':path,'depth':len(path)-1}
             if len(path)-1>=max_depth:continue
-            for e in self.store.edges_from(node):
+            for e in self.store.edges_from(node)[:100]:
                 nxt=e['to_key']
                 if nxt not in seen:
                     seen.add(nxt);q.append((nxt,path+[nxt]))

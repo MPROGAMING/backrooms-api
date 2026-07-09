@@ -59,8 +59,8 @@ from fastapi.responses import JSONResponse
 # =============================================================================
 
 APP_NAME = "BackroomsGPT Omni-Lore Gateway"
-APP_VERSION = "13.0.0"
-BUILD_NAME = "OMNI-LORE-V13"
+APP_VERSION = "14.0.0"
+BUILD_NAME = "OMNI-LORE-V14"
 DEFAULT_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "18"))
 DEFAULT_CONNECT_TIMEOUT_SECONDS = float(os.getenv("HTTP_CONNECT_TIMEOUT_SECONDS", "7"))
 DEFAULT_CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
@@ -72,6 +72,9 @@ MAX_OMNI_CONCURRENCY = int(os.getenv("MAX_OMNI_CONCURRENCY", "10"))
 MAX_SOURCE_SEARCH_RESULTS = int(os.getenv("MAX_SOURCE_SEARCH_RESULTS", "12"))
 MAX_COMPARE_SOURCES = int(os.getenv("MAX_COMPARE_SOURCES", "12"))
 MAX_CDX_ROWS = int(os.getenv("MAX_CDX_ROWS", "500"))
+ARCHIVE_MIN_SIMILARITY = float(os.getenv("ARCHIVE_MIN_SIMILARITY", "0.78"))
+LIVE_SEARCH_MIN_SIMILARITY = float(os.getenv("LIVE_SEARCH_MIN_SIMILARITY", "0.40"))
+COMPARE_SECTION_EXCERPT_CHARS = int(os.getenv("COMPARE_SECTION_EXCERPT_CHARS", "900"))
 SERVICE_STARTED_AT = time.monotonic()
 
 logging.basicConfig(
@@ -1237,6 +1240,79 @@ def title_similarity(query: str, title: str) -> float:
     return max(containment, SequenceMatcher(None, q, t).ratio())
 
 
+_GENERIC_MATCH_TOKENS = {
+    "level", "entity", "object", "page", "wiki", "the", "a", "an",
+    "backrooms", "archive", "archives", "liminal",
+}
+
+
+def extract_level_identifier(value: str) -> Optional[str]:
+    """Extract the explicit Level number from a title, slug, or URL.
+
+    The comparison is intentionally strict. A query for Level 0 must never
+    accept Level 10.1 merely because the strings are superficially similar.
+    """
+    raw = unquote(value or "").casefold()
+    raw = raw.replace("_", " ").replace("-", " ")
+    raw = re.sub(r"\s+", " ", raw)
+    match = re.search(r"\blevel\s+(-?\d+(?:\.\d+)?)\b", raw)
+    if not match:
+        return None
+    number = match.group(1)
+    try:
+        parsed = float(number)
+        return str(int(parsed)) if parsed.is_integer() else str(parsed).rstrip("0").rstrip(".")
+    except ValueError:
+        return number
+
+
+def archive_candidate_match_score(
+    query: str,
+    candidate_title: str,
+    original_url: str = "",
+) -> float:
+    """Return a conservative identity score for an archived candidate.
+
+    This scorer intentionally rejects numeric Level mismatches before fuzzy
+    similarity is considered. It also evaluates the original URL path because
+    archived page titles can be generic even when the slug is precise.
+    """
+    query_level = extract_level_identifier(query)
+    candidate_level = extract_level_identifier(f"{candidate_title} {original_url}")
+    if query_level is not None:
+        if candidate_level is None:
+            return 0.0
+        if query_level != candidate_level:
+            return 0.0
+
+    original_path = unquote(urlparse(original_url).path).replace("/", " ") if original_url else ""
+    score = max(
+        title_similarity(query, candidate_title),
+        title_similarity(query, original_path),
+    )
+
+    q_tokens = {
+        token for token in normalize_title_key(query).split()
+        if token not in _GENERIC_MATCH_TOKENS
+    }
+    candidate_tokens = set(normalize_title_key(f"{candidate_title} {original_path}").split())
+    if q_tokens:
+        coverage = len(q_tokens & candidate_tokens) / len(q_tokens)
+        score = max(score, coverage)
+
+    return round(score, 4)
+
+
+def archive_candidate_is_acceptable(
+    query: str,
+    candidate_title: str,
+    original_url: str = "",
+    *,
+    threshold: float = ARCHIVE_MIN_SIMILARITY,
+) -> bool:
+    return archive_candidate_match_score(query, candidate_title, original_url) >= threshold
+
+
 # =============================================================================
 # 8. NORMALIZED RESULT TYPES
 # =============================================================================
@@ -1667,9 +1743,9 @@ class WaybackAdapter:
         for row in rows[1:]:
             item = dict(zip(headers, row))
             original = item.get("original", "")
-            path_text = normalize_title_key(urlparse(original).path)
-            score = title_similarity(query_key, path_text)
-            if query_key and query_key not in path_text and score < 0.55:
+            candidate_title = unquote(urlparse(original).path.strip("/").replace("-", " ")) or domain
+            score = archive_candidate_match_score(query, candidate_title, original)
+            if not archive_candidate_is_acceptable(query, candidate_title, original):
                 continue
             timestamp = item.get("timestamp", "")
             archived_url = f"https://web.archive.org/web/{timestamp}id_/{original}"
@@ -1677,7 +1753,7 @@ class WaybackAdapter:
                 (
                     score,
                     {
-                        "title": unquote(urlparse(original).path.strip("/").replace("-", " ")) or domain,
+                        "title": candidate_title,
                         "original_url": original,
                         "archive_url": archived_url,
                         "timestamp": timestamp,
@@ -1717,6 +1793,15 @@ class WaybackAdapter:
         )
         if not doc.text or doc.missing_page_signal:
             raise PageNotFound(f"Archived snapshot has no readable content for {requested_query}")
+
+        if not archive_candidate_is_acceptable(
+            requested_query,
+            doc.title or requested_query,
+            archive_url,
+        ):
+            raise PageNotFound(
+                f"Archived snapshot identity did not safely match '{requested_query}'."
+            )
 
         return PagePayload(
             source_id=source.id,
@@ -1946,6 +2031,9 @@ class WikidotAdapter(BaseAdapter):
                 if normalized_url in seen:
                     continue
                 seen.add(normalized_url)
+                relevance = round(title_similarity(query, title), 4)
+                if relevance < LIVE_SEARCH_MIN_SIMILARITY:
+                    continue
                 live_hits.append(
                     SearchHit(
                         source_id=self.source.id,
@@ -1954,7 +2042,7 @@ class WikidotAdapter(BaseAdapter):
                         title=title,
                         url=normalized_url,
                         snippet="",
-                        score=round(title_similarity(query, title), 4),
+                        score=relevance,
                         archived=False,
                         language=self.source.language,
                     )
@@ -2408,10 +2496,27 @@ class OmniLoreEngine:
         *,
         source_ids: Optional[Sequence[str]] = None,
         scope: str = "core",
-        max_chars_per_source: int = 50000,
+        max_chars_per_source: int = 16000,
     ) -> dict:
+        """Compare a concept across sources using compact canon-separated records.
+
+        Full page text is fetched internally for analysis but is deliberately not
+        returned by this endpoint. That keeps Custom GPT Action payloads bounded
+        and prevents multi-source comparisons from exceeding tool response limits.
+        Full text remains available through /source/page when deeper inspection is
+        needed.
+        """
+        max_chars_per_source = clamp_int(max_chars_per_source, 4000, 40000)
         sources = self._select_sources(scope=scope, source_ids=source_ids)[:MAX_COMPARE_SOURCES]
         semaphore = asyncio.Semaphore(MAX_OMNI_CONCURRENCY)
+
+        def compact_sections(section_extracts: Mapping[str, Any]) -> dict:
+            compact: Dict[str, str] = {}
+            for name, value in section_extracts.items():
+                text = compact_ws(str(value or ""))
+                if text:
+                    compact[name] = text[:COMPARE_SECTION_EXCERPT_CHARS]
+            return compact
 
         async def fetch_one(source: SourceConfig):
             async with semaphore:
@@ -2421,12 +2526,24 @@ class OmniLoreEngine:
                         max_chars=max_chars_per_source,
                         allow_archive_fallback=True,
                     )
+                    payload = page.to_dict()
+                    analysis = payload.get("analysis", {})
                     return {
                         "source_id": source.id,
                         "source_name": source.name,
                         "canon": source.canon,
                         "ok": True,
-                        "page": page.to_dict(),
+                        "title": payload.get("title"),
+                        "url": payload.get("url"),
+                        "archived": payload.get("archived", False),
+                        "archive_timestamp": payload.get("archive_timestamp"),
+                        "language": payload.get("language"),
+                        "summary": compact_ws(analysis.get("summary", ""))[:1800],
+                        "detected_sections": analysis.get("detected_sections", {}),
+                        "named_signals": analysis.get("named_signals", {}),
+                        "heuristic_hazard_signal": analysis.get("heuristic_hazard_signal", {}),
+                        "section_extracts": compact_sections(analysis.get("section_extracts", {})),
+                        "resolved_via": payload.get("resolved_via"),
                     }
                 except Exception as exc:
                     return {
@@ -2440,23 +2557,20 @@ class OmniLoreEngine:
         records = await asyncio.gather(*(fetch_one(source) for source in sources))
         successful = [record for record in records if record["ok"]]
 
-        # Build lightweight structural comparison without blending canons.
-        comparison_matrix = []
-        for record in successful:
-            analysis = record["page"].get("analysis", {})
-            comparison_matrix.append(
-                {
-                    "source_id": record["source_id"],
-                    "canon": record["canon"],
-                    "title": record["page"].get("title"),
-                    "summary": analysis.get("summary", ""),
-                    "detected_sections": analysis.get("detected_sections", {}),
-                    "named_signals": analysis.get("named_signals", {}),
-                    "heuristic_hazard_signal": analysis.get("heuristic_hazard_signal", {}),
-                    "archived": record["page"].get("archived", False),
-                    "url": record["page"].get("url"),
-                }
-            )
+        comparison_matrix = [
+            {
+                "source_id": record["source_id"],
+                "canon": record["canon"],
+                "title": record.get("title"),
+                "summary": record.get("summary", ""),
+                "detected_sections": record.get("detected_sections", {}),
+                "named_signals": record.get("named_signals", {}),
+                "heuristic_hazard_signal": record.get("heuristic_hazard_signal", {}),
+                "archived": record.get("archived", False),
+                "url": record.get("url"),
+            }
+            for record in successful
+        ]
 
         return {
             "ok": bool(successful),
@@ -2468,7 +2582,11 @@ class OmniLoreEngine:
                 "successful_sources": len(successful),
                 "failed_sources": len(records) - len(successful),
                 "timestamp": utc_now_iso(),
-                "note": "Canons are preserved separately. The API does not merge conflicting lore into a single canon.",
+                "payload_mode": "compact-comparison",
+                "note": (
+                    "Canons are preserved separately. Full page text is intentionally omitted "
+                    "from comparison responses; fetch individual pages for deeper reading."
+                ),
             },
         }
 
@@ -2909,7 +3027,7 @@ async def omni_compare(
     q: str,
     scope: str = "core",
     source_ids: Optional[str] = None,
-    max_chars_per_source: int = 50000,
+    max_chars_per_source: int = 16000,
 ):
     try:
         return await omni.compare(

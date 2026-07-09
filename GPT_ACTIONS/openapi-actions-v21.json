@@ -1,0 +1,558 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "BackroomsGPT Final API",
+    "version": "21.0.0",
+    "description": "BackroomsGPT FINAL: live canon-aware lore retrieval plus bounded Atlas research, project workflow, media research, source discovery, and release evals. Live source data remains authoritative for current lore; Atlas is an indexed research layer."
+  },
+  "servers": [
+    {
+      "url": "https://backrooms-api.onrender.com",
+      "description": "BackroomsGPT production API"
+    }
+  ],
+  "paths": {
+    "/sources": {
+      "get": {
+        "tags": ["Live lore"],
+        "summary": "List registered Backrooms lore sources",
+        "operationId": "listBackroomsLoreSources",
+        "parameters": [
+          {"name": "canon", "in": "query", "schema": {"type": "string", "maxLength": 120}},
+          {"name": "kind", "in": "query", "schema": {"type": "string", "maxLength": 40}},
+          {"name": "language", "in": "query", "schema": {"type": "string", "maxLength": 24}},
+          {"name": "live_only", "in": "query", "schema": {"type": "boolean", "default": false}},
+          {"name": "tag", "in": "query", "schema": {"type": "string", "maxLength": 80}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/SourceList"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/sources/health": {
+      "get": {
+        "tags": ["Live lore"],
+        "summary": "Probe registered source health",
+        "operationId": "probeBackroomsLoreSources",
+        "parameters": [
+          {"name": "source_ids", "in": "query", "description": "Comma-separated source IDs; omit for core sources.", "schema": {"type": "string", "maxLength": 2000}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/SourceHealth"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/source/search": {
+      "get": {
+        "tags": ["Live lore"],
+        "summary": "Search one registered source",
+        "operationId": "searchBackroomsSource",
+        "parameters": [
+          {"name": "source_id", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 120}},
+          {"name": "q", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 12, "default": 10}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Search"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/source/page": {
+      "get": {
+        "tags": ["Live lore"],
+        "summary": "Fetch a page from one registered source",
+        "operationId": "fetchBackroomsSourcePage",
+        "parameters": [
+          {"name": "source_id", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 120}},
+          {"name": "page", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "max_chars", "in": "query", "description": "Use a compact excerpt unless the user explicitly needs more.", "schema": {"type": "integer", "minimum": 2000, "maximum": 60000, "default": 24000}},
+          {"name": "allow_archive_fallback", "in": "query", "description": "False by default for current-fact questions. Enable only when historical archive material is appropriate.", "schema": {"type": "boolean", "default": false}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Page"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/omni/search": {
+      "get": {
+        "tags": ["Live lore"],
+        "summary": "Search across separate Backrooms sources",
+        "operationId": "searchAllBackroomsLore",
+        "parameters": [
+          {"name": "q", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "scope", "in": "query", "schema": {"type": "string", "enum": ["core", "international", "extended", "all"], "default": "core"}},
+          {"name": "source_ids", "in": "query", "description": "Comma-separated source IDs, maximum 12.", "schema": {"type": "string", "maxLength": 2000}},
+          {"name": "languages", "in": "query", "description": "Comma-separated language codes, maximum 12.", "schema": {"type": "string", "maxLength": 2000}},
+          {"name": "per_source_limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 12, "default": 6}},
+          {"name": "total_limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 40, "default": 40}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/OmniSearch"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/omni/resolve": {
+      "get": {
+        "tags": ["Live lore"],
+        "summary": "Resolve an uncertain lore title and fetch the best candidate",
+        "operationId": "resolveBestBackroomsLorePage",
+        "parameters": [
+          {"name": "q", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "scope", "in": "query", "schema": {"type": "string", "enum": ["core", "international", "extended", "all"], "default": "core"}},
+          {"name": "source_ids", "in": "query", "description": "Comma-separated source IDs, maximum 12.", "schema": {"type": "string", "maxLength": 2000}},
+          {"name": "max_chars", "in": "query", "schema": {"type": "integer", "minimum": 2000, "maximum": 60000, "default": 24000}},
+          {"name": "allow_archive_fallback", "in": "query", "description": "Enable only if a labeled historical archive result is useful.", "schema": {"type": "boolean", "default": false}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Resolve"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/omni/compare": {
+      "get": {
+        "tags": ["Live lore"],
+        "summary": "Compare a concept across separate canons with compact records",
+        "operationId": "compareBackroomsCanons",
+        "parameters": [
+          {"name": "q", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "scope", "in": "query", "schema": {"type": "string", "enum": ["core", "international", "extended", "all"], "default": "core"}},
+          {"name": "source_ids", "in": "query", "description": "Comma-separated source IDs, maximum 12.", "schema": {"type": "string", "maxLength": 2000}},
+          {"name": "max_chars_per_source", "in": "query", "description": "Compact comparison budget per source; fetch individual pages only when deeper detail is necessary.", "schema": {"type": "integer", "minimum": 4000, "maximum": 40000, "default": 16000}},
+          {"name": "allow_archive_fallback", "in": "query", "description": "False by default. Enable only when a clearly labeled historical archive comparison is explicitly wanted.", "schema": {"type": "boolean", "default": false}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Compare"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/omni/recent": {
+      "get": {
+        "tags": ["Live lore"],
+        "summary": "Get recent pages across configured sources",
+        "operationId": "getRecentBackroomsLoreChanges",
+        "parameters": [
+          {"name": "scope", "in": "query", "schema": {"type": "string", "enum": ["core", "international", "extended", "all"], "default": "core"}},
+          {"name": "source_ids", "in": "query", "description": "Comma-separated source IDs, maximum 12.", "schema": {"type": "string", "maxLength": 2000}},
+          {"name": "per_source_limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 10, "default": 8}},
+          {"name": "total_limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 40, "default": 40}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Recent"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/omni/graph": {
+      "get": {
+        "tags": ["Live lore"],
+        "summary": "Build a bounded live page-link graph",
+        "operationId": "buildBackroomsLoreGraph",
+        "parameters": [
+          {"name": "source_id", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 120}},
+          {"name": "page", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "depth", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 2, "default": 1}},
+          {"name": "max_nodes", "in": "query", "schema": {"type": "integer", "minimum": 2, "maximum": 60, "default": 25}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/LiveGraph"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/archives/liminal/search": {
+      "get": {
+        "tags": ["Liminal Archives"],
+        "summary": "Search Liminal Archives before fetching uncertain titles",
+        "operationId": "searchLiminalArchives",
+        "parameters": [
+          {"name": "q", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 12, "default": 10}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Search"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/archives/liminal": {
+      "get": {
+        "tags": ["Liminal Archives"],
+        "summary": "Fetch a resolved Liminal Archives page",
+        "operationId": "fetchLiminalArchivesPage",
+        "parameters": [
+          {"name": "page", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "max_chars", "in": "query", "schema": {"type": "integer", "minimum": 2000, "maximum": 60000, "default": 24000}},
+          {"name": "allow_archive_fallback", "in": "query", "description": "Archive data is historical and must remain labeled.", "schema": {"type": "boolean", "default": false}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Page"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/dynamic/fandom/search": {
+      "get": {
+        "tags": ["Dynamic sources"],
+        "summary": "Search a public Fandom hostname supplied by the user",
+        "operationId": "searchDynamicFandomWiki",
+        "parameters": [
+          {"name": "site", "in": "query", "required": true, "description": "Public .fandom.com hostname only.", "schema": {"type": "string", "minLength": 12, "maxLength": 253}},
+          {"name": "q", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 12, "default": 10}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Search"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/dynamic/fandom/page": {
+      "get": {
+        "tags": ["Dynamic sources"],
+        "summary": "Fetch a public Fandom page",
+        "operationId": "fetchDynamicFandomPage",
+        "parameters": [
+          {"name": "site", "in": "query", "required": true, "description": "Public .fandom.com hostname only.", "schema": {"type": "string", "minLength": 12, "maxLength": 253}},
+          {"name": "page", "in": "query", "required": true, "description": "Page title. The legacy title parameter is not used by v21 Actions.", "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "max_chars", "in": "query", "schema": {"type": "integer", "minimum": 2000, "maximum": 60000, "default": 24000}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Page"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/dynamic/wikidot/search": {
+      "get": {
+        "tags": ["Dynamic sources"],
+        "summary": "Search a public Wikidot hostname supplied by the user",
+        "operationId": "searchDynamicWikidotSite",
+        "parameters": [
+          {"name": "site", "in": "query", "required": true, "description": "Public .wikidot.com hostname only.", "schema": {"type": "string", "minLength": 13, "maxLength": 253}},
+          {"name": "q", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 12, "default": 10}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Search"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/dynamic/wikidot/page": {
+      "get": {
+        "tags": ["Dynamic sources"],
+        "summary": "Fetch a public Wikidot page",
+        "operationId": "fetchDynamicWikidotPage",
+        "parameters": [
+          {"name": "site", "in": "query", "required": true, "description": "Public .wikidot.com hostname only.", "schema": {"type": "string", "minLength": 13, "maxLength": 253}},
+          {"name": "page", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "max_chars", "in": "query", "schema": {"type": "integer", "minimum": 2000, "maximum": 60000, "default": 24000}},
+          {"name": "allow_archive_fallback", "in": "query", "schema": {"type": "boolean", "default": false}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Page"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/url/read": {
+      "get": {
+        "tags": ["Dynamic sources"],
+        "summary": "Read a supported public Fandom or Wikidot URL",
+        "operationId": "readSupportedBackroomsWikiUrl",
+        "parameters": [
+          {"name": "url", "in": "query", "required": true, "schema": {"type": "string", "format": "uri", "minLength": 12, "maxLength": 2048}},
+          {"name": "max_chars", "in": "query", "schema": {"type": "integer", "minimum": 2000, "maximum": 60000, "default": 24000}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Page"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/index/search": {
+      "get": {
+        "tags": ["Atlas research"],
+        "summary": "Hybrid search over the selectively indexed Atlas corpus",
+        "operationId": "searchAtlasIndex",
+        "parameters": [
+          {"name": "q", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "source_ids", "in": "query", "description": "Optional repeated source_id filters.", "style": "form", "explode": true, "schema": {"type": "array", "maxItems": 12, "items": {"type": "string", "minLength": 1, "maxLength": 120}}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/AtlasSearch"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/index/ingest": {
+      "post": {
+        "tags": ["Atlas write"],
+        "summary": "Resolve and persist one live lore page in Atlas",
+        "operationId": "ingestLoreIntoAtlas",
+        "description": "Persistent write. Call only when the user explicitly asks to index material or authorizes a project workflow that needs it.",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IngestRequest"}}}},
+        "responses": {"200": {"$ref": "#/components/responses/Ingest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/index/sync-recent": {
+      "post": {
+        "tags": ["Atlas write"],
+        "summary": "Persist a bounded set of recent pages in Atlas",
+        "operationId": "syncRecentLoreIntoAtlas",
+        "description": "Persistent, potentially expensive write. Use only on explicit user or operator request.",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SyncRecentRequest"}}}},
+        "responses": {"200": {"$ref": "#/components/responses/Sync"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/stats": {
+      "get": {
+        "tags": ["Atlas research"],
+        "summary": "Get Atlas coverage and bounded telemetry statistics",
+        "operationId": "getAtlasStats",
+        "responses": {"200": {"$ref": "#/components/responses/AtlasStats"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/diff/{doc_id}": {
+      "get": {
+        "tags": ["Atlas research"],
+        "summary": "Compare the newest two stored snapshots of an indexed page",
+        "operationId": "diffIndexedLorePage",
+        "parameters": [
+          {"name": "doc_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 64}},
+          {"name": "context", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 8, "default": 3}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Diff"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/graph/related/{doc_id}": {
+      "get": {
+        "tags": ["Atlas research"],
+        "summary": "Get bounded stored graph relationships for an indexed page",
+        "operationId": "getIndexedLoreRelationships",
+        "parameters": [
+          {"name": "doc_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 64}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 60, "default": 30}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Related"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/media/commons/search": {
+      "get": {
+        "tags": ["Media research"],
+        "summary": "Search Wikimedia Commons for relevance-ranked media candidates",
+        "operationId": "searchCommonsForBackroomsMedia",
+        "parameters": [
+          {"name": "q", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 500}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 30, "default": 12}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Commons"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/projects": {
+      "post": {
+        "tags": ["Writer projects"],
+        "summary": "Create a retained Writer Project with a per-project access capability",
+        "operationId": "createBackroomsWriterProject",
+        "description": "Persistent write. Call only after the user explicitly asks to create a project and understands that its returned access capability is required later.",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectCreateRequest"}}}},
+        "responses": {"200": {"$ref": "#/components/responses/ProjectCreate"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/projects/{project_id}": {
+      "get": {
+        "tags": ["Writer projects"],
+        "summary": "Read a Writer Project using its access capability",
+        "operationId": "getBackroomsWriterProject",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "parameters": [
+          {"name": "project_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 64}},
+          {"name": "X-Project-Access-Token", "in": "header", "required": true, "description": "Per-project capability returned at creation. Never expose it in normal prose.", "schema": {"type": "string", "minLength": 32, "maxLength": 256}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/Project"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      },
+      "patch": {
+        "tags": ["Writer projects"],
+        "summary": "Update a Writer Project and optionally set its stage",
+        "operationId": "updateBackroomsWriterProject",
+        "description": "Persistent write. Use only after a user asks to save a specific project change.",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "parameters": [
+          {"name": "project_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 64}}
+        ],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectUpdateRequest"}}}},
+        "responses": {"200": {"$ref": "#/components/responses/Project"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      },
+      "delete": {
+        "tags": ["Writer projects"],
+        "summary": "Permanently delete a Writer Project",
+        "operationId": "deleteBackroomsWriterProject",
+        "description": "Destructive persistent action. Call only after an explicit deletion request.",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "parameters": [
+          {"name": "project_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 64}},
+          {"name": "X-Project-Access-Token", "in": "header", "required": true, "description": "Per-project capability returned at creation.", "schema": {"type": "string", "minLength": 32, "maxLength": 256}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/ProjectDelete"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/projects/{project_id}/advance": {
+      "post": {
+        "tags": ["Writer projects"],
+        "summary": "Advance a Writer Project to its next stage",
+        "operationId": "advanceBackroomsWriterProject",
+        "description": "Persistent write. Use only after the user asks to move to the next workflow stage.",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "parameters": [
+          {"name": "project_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 64}}
+        ],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectCapabilityRequest"}}}},
+        "responses": {"200": {"$ref": "#/components/responses/Project"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/projects/{project_id}/overlap-research": {
+      "post": {
+        "tags": ["Writer projects"],
+        "summary": "Run bounded Atlas overlap research for a Writer Project",
+        "operationId": "researchProjectOverlap",
+        "description": "Persistent write because research is saved to the project. Call only when the user asks to save project research.",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "parameters": [
+          {"name": "project_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 64}}
+        ],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectOverlapRequest"}}}},
+        "responses": {"200": {"$ref": "#/components/responses/ProjectResearch"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/projects/{project_id}/checklist": {
+      "get": {
+        "tags": ["Writer projects"],
+        "summary": "Get a Writer Project readiness checklist",
+        "operationId": "getProjectReadinessChecklist",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "parameters": [
+          {"name": "project_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 64}},
+          {"name": "X-Project-Access-Token", "in": "header", "required": true, "description": "Per-project capability returned at creation.", "schema": {"type": "string", "minLength": 32, "maxLength": 256}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/ProjectChecklist"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/discovery/scan": {
+      "post": {
+        "tags": ["Atlas write"],
+        "summary": "Discover candidate Fandom and Wikidot hosts from a bounded safe seed",
+        "operationId": "discoverBackroomsWikiCandidates",
+        "description": "Persistent candidate write. Call only when a user explicitly asks for discovery; candidates are never automatically trusted or promoted.",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DiscoveryRequest"}}}},
+        "responses": {"200": {"$ref": "#/components/responses/Discovery"}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/discovery/candidates/{candidate_id}/probe": {
+      "post": {
+        "tags": ["Atlas write"],
+        "summary": "Safely probe one discovered candidate without promoting it",
+        "operationId": "probeBackroomsWikiCandidate",
+        "description": "Protected, bounded reachability and HTML probe only. It never changes candidate status and never adds a candidate to the source registry. Use only after the user explicitly asks to check a discovered candidate.",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "parameters": [
+          {"name": "candidate_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 64}}
+        ],
+        "responses": {"200": {"$ref": "#/components/responses/CandidateProbe"}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/atlas/evals/acceptance": {
+      "post": {
+        "tags": ["Atlas write"],
+        "summary": "Run the bounded BackroomsGPT acceptance regression suite",
+        "operationId": "runBackroomsGPTAcceptanceEvals",
+        "description": "Persistent eval-history write and potentially expensive live work. Use only for explicit release validation, never normal user research.",
+        "security": [{"BackroomsGPTWriteKey": []}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EvalRequest"}}}},
+        "responses": {"200": {"$ref": "#/components/responses/Eval"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "422": {"$ref": "#/components/responses/ValidationFailure"}, "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}, "default": {"$ref": "#/components/responses/Error"}}
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BackroomsGPTWriteKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "API key",
+        "description": "Service-level Custom GPT Action credential. It authorizes protected service operations but is not a user identity or a Writer Project capability."
+      }
+    },
+    "responses": {
+      "SourceList": {"description": "Registered source records.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SourceListResponse"}}}},
+      "SourceHealth": {"description": "Current source health results.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SourceHealthResponse"}}}},
+      "Search": {"description": "Search hits; fetch a full page before making important claims.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SearchResponse"}}}},
+      "Page": {"description": "Fetched page with source provenance and archive state.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PageResponse"}}}},
+      "OmniSearch": {"description": "Cross-source search results kept canon-aware.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OmniSearchResponse"}}}},
+      "Resolve": {"description": "Resolved candidate and fetched page, with alternatives and attempts.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResolveResponse"}}}},
+      "Compare": {"description": "Compact separate canon records, not a merged canon.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CompareResponse"}}}},
+      "Recent": {"description": "Recent-page records.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RecentResponse"}}}},
+      "LiveGraph": {"description": "Bounded live link graph.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LiveGraphResponse"}}}},
+      "AtlasSearch": {"description": "Hybrid Atlas ranking results; scores are not duplication proof.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AtlasSearchResponse"}}}},
+      "Ingest": {"description": "Atlas ingest result.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IngestResponse"}}}},
+      "Sync": {"description": "Bounded recent-sync result.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SyncResponse"}}}},
+      "AtlasStats": {"description": "Atlas index and storage-mode statistics.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AtlasStatsResponse"}}}},
+      "Diff": {"description": "Bounded snapshot diff.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DiffResponse"}}}},
+      "Related": {"description": "Stored graph relationships.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RelatedResponse"}}}},
+      "Commons": {"description": "Wikimedia Commons research candidates only.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CommonsResponse"}}}},
+      "ProjectCreate": {"description": "Created project and one-time access capability.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectCreateResponse"}}}},
+      "Project": {"description": "Writer Project state.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectResponse"}}}},
+      "ProjectResearch": {"description": "Saved project overlap-research result.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectResearchResponse"}}}},
+      "ProjectChecklist": {"description": "Project readiness checklist.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectChecklistResponse"}}}},
+      "ProjectDelete": {"description": "Project deletion result.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectDeleteResponse"}}}},
+      "Discovery": {"description": "Candidate source discovery result.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DiscoveryResponse"}}}},
+      "CandidateProbe": {"description": "Bounded candidate reachability probe; success does not approve or register the candidate.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CandidateProbeResponse"}}}},
+      "Eval": {"description": "Acceptance eval run result.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EvalResponse"}}}},
+      "BadRequest": {"description": "Invalid request for this operation.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+      "Unauthorized": {"description": "A valid service Bearer credential is required.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+      "NotFound": {"description": "The requested resource was not found or its capability was invalid.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+      "ValidationFailure": {"description": "Request validation failed.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+      "RateLimited": {"description": "Operation rate or concurrency limit reached.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+      "Unavailable": {"description": "Source or protected operation is temporarily unavailable.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+      "Error": {"description": "Structured BackroomsGPT error response.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}}
+    },
+    "schemas": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {"type": "string"},
+          "message": {"type": "string"},
+          "retryable": {"type": "boolean"},
+          "source_id": {"type": "string"},
+          "details": {"type": "object", "properties": {}, "additionalProperties": true}
+        },
+        "required": ["code", "message", "retryable"],
+        "additionalProperties": true
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "ok": {"type": "boolean", "const": false},
+          "error": {"$ref": "#/components/schemas/ErrorDetail"},
+          "meta": {"type": "object", "properties": {"service": {"type": "string"}, "version": {"type": "string"}, "timestamp": {"type": "string"}}, "additionalProperties": true}
+        },
+        "required": ["ok", "error"],
+        "additionalProperties": true
+      },
+      "Source": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"}, "name": {"type": "string"}, "kind": {"type": "string"}, "canon": {"type": "string"}, "language": {"type": "string"}, "live": {"type": "boolean"}, "searchable": {"type": "boolean"}, "recent_changes": {"type": "boolean"}, "aliases": {"type": "array", "items": {"type": "string"}}, "tags": {"type": "array", "items": {"type": "string"}}, "notes": {"type": "string"}
+        },
+        "additionalProperties": true
+      },
+      "SearchHit": {
+        "type": "object",
+        "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "source_id": {"type": "string"}, "source_name": {"type": "string"}, "canon": {"type": "string"}, "snippet": {"type": "string"}, "archived": {"type": "boolean"}, "archive_timestamp": {"type": ["string", "null"]}, "score": {"type": "number"}},
+        "additionalProperties": true
+      },
+      "Page": {
+        "type": "object",
+        "properties": {
+          "source_id": {"type": "string"}, "source_name": {"type": "string"}, "canon": {"type": "string"}, "title": {"type": "string"}, "url": {"type": "string"}, "text": {"type": "string"}, "headings": {"type": "array", "items": {"type": "string"}}, "links": {"type": "array", "items": {"type": "object", "properties": {"title": {"type": "string"}, "url": {"type": "string"}}, "additionalProperties": true}}, "image_urls": {"type": "array", "items": {"type": "string"}}, "analysis": {"type": "object", "properties": {}, "additionalProperties": true}, "provenance": {"type": "object", "properties": {}, "additionalProperties": true}, "retrieved_at": {"type": "string"}, "archived": {"type": "boolean"}, "archive_timestamp": {"type": ["string", "null"]}, "truncated": {"type": "boolean"}, "upstream_diagnostics": {"type": "array", "items": {"type": "object", "properties": {}, "additionalProperties": true}}
+        },
+        "required": ["source_id", "canon", "title", "url", "text", "archived"],
+        "additionalProperties": true
+      },
+      "SourceListResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "sources": {"type": "array", "items": {"$ref": "#/components/schemas/Source"}}, "count": {"type": "integer"}, "meta": {"type": "object", "properties": {}, "additionalProperties": true}}, "required": ["ok", "sources", "count"], "additionalProperties": true},
+      "SourceHealthResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "results": {"type": "array", "items": {"type": "object", "properties": {"source_id": {"type": "string"}, "ok": {"type": "boolean"}, "error": {"type": "string"}}, "additionalProperties": true}}, "healthy": {"type": "integer"}, "unhealthy": {"type": "integer"}, "timestamp": {"type": "string"}}, "required": ["ok", "results"], "additionalProperties": true},
+      "SearchResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "source": {"$ref": "#/components/schemas/Source"}, "query": {"type": "string"}, "results": {"type": "array", "items": {"$ref": "#/components/schemas/SearchHit"}}}, "required": ["ok", "results"], "additionalProperties": true},
+      "PageResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "page": {"$ref": "#/components/schemas/Page"}}, "required": ["ok", "page"], "additionalProperties": true},
+      "OmniSearchResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "query": {"type": "string"}, "results": {"type": "array", "items": {"$ref": "#/components/schemas/SearchHit"}}, "meta": {"type": "object", "properties": {}, "additionalProperties": true}}, "required": ["ok", "results"], "additionalProperties": true},
+      "ResolveResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "query": {"type": "string"}, "selected_result": {"$ref": "#/components/schemas/SearchHit"}, "page": {"$ref": "#/components/schemas/Page"}, "alternatives": {"type": "array", "items": {"$ref": "#/components/schemas/SearchHit"}}, "attempts": {"type": "array", "items": {"type": "object", "properties": {}, "additionalProperties": true}}, "meta": {"type": "object", "properties": {}, "additionalProperties": true}}, "required": ["ok"], "additionalProperties": true},
+      "CompareRecord": {"type": "object", "properties": {"source_id": {"type": "string"}, "source_name": {"type": "string"}, "canon": {"type": "string"}, "title": {"type": "string"}, "url": {"type": "string"}, "summary": {"type": "string"}, "archived": {"type": "boolean"}, "sections": {"type": "object", "properties": {}, "additionalProperties": true}}, "additionalProperties": true},
+      "CompareResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "query": {"type": "string"}, "records": {"type": "array", "items": {"$ref": "#/components/schemas/CompareRecord"}}, "meta": {"type": "object", "properties": {"payload_mode": {"type": "string"}}, "additionalProperties": true}}, "required": ["ok", "records"], "additionalProperties": true},
+      "RecentResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "results": {"type": "array", "items": {"$ref": "#/components/schemas/SearchHit"}}, "meta": {"type": "object", "properties": {}, "additionalProperties": true}}, "required": ["ok", "results"], "additionalProperties": true},
+      "LiveGraphResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "source_id": {"type": "string"}, "root": {"type": "string"}, "nodes": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "url": {"type": "string"}, "depth": {"type": "integer"}}, "additionalProperties": true}}, "edges": {"type": "array", "items": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "label": {"type": "string"}}, "additionalProperties": true}}, "meta": {"type": "object", "properties": {}, "additionalProperties": true}}, "required": ["ok", "nodes", "edges"], "additionalProperties": true},
+      "AtlasSearchResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "query": {"type": "string"}, "results": {"type": "array", "items": {"type": "object", "properties": {"doc_id": {"type": "string"}, "source_id": {"type": "string"}, "canon": {"type": "string"}, "title": {"type": "string"}, "url": {"type": "string"}, "summary": {"type": "string"}, "archived": {"type": "boolean"}, "score": {"type": "number"}, "score_breakdown": {"type": "object", "properties": {"lexical": {"type": "number"}, "semantic": {"type": "number"}, "title": {"type": "number"}}, "additionalProperties": true}}, "additionalProperties": true}}, "meta": {"type": "object", "properties": {"indexed_documents": {"type": "integer"}, "documents_scanned": {"type": "integer"}, "coverage_limited": {"type": "boolean"}, "method": {"type": "string"}, "note": {"type": "string"}}, "additionalProperties": true}}, "required": ["ok", "results"], "additionalProperties": true},
+      "IngestResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "query": {"type": "string"}, "indexed": {"type": "object", "properties": {"doc_id": {"type": "string"}, "source_id": {"type": "string"}, "canon": {"type": "string"}, "title": {"type": "string"}, "url": {"type": "string"}, "content_hash": {"type": "string"}, "archived": {"type": "boolean"}}, "additionalProperties": true}, "alternatives": {"type": "array", "items": {"$ref": "#/components/schemas/SearchHit"}}}, "required": ["ok"], "additionalProperties": true},
+      "SyncResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "attempted": {"type": "integer"}, "indexed": {"type": "integer"}, "failed": {"type": "integer"}, "results": {"type": "array", "items": {"type": "object", "properties": {"ok": {"type": "boolean"}, "source_id": {"type": "string"}, "title": {"type": "string"}, "error": {"type": "string"}}, "additionalProperties": true}}}, "required": ["ok"], "additionalProperties": true},
+      "AtlasStatsResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "version": {"type": "string"}, "stats": {"type": "object", "properties": {"documents": {"type": "integer"}, "snapshots": {"type": "integer"}, "edges": {"type": "integer"}, "projects": {"type": "integer"}, "storage_mode": {"type": "string"}, "telemetry_retention_rows": {"type": "integer"}}, "additionalProperties": true}}, "required": ["ok", "version", "stats"], "additionalProperties": true},
+      "DiffResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "doc_id": {"type": "string"}, "message": {"type": "string"}, "from": {"type": "string"}, "to": {"type": "string"}, "old_hash": {"type": "string"}, "new_hash": {"type": "string"}, "added_terms": {"type": "array", "items": {"type": "string"}}, "removed_terms": {"type": "array", "items": {"type": "string"}}, "unified_diff": {"type": "string"}, "truncated": {"type": "boolean"}}, "required": ["ok", "doc_id"], "additionalProperties": true},
+      "RelatedResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "doc_id": {"type": "string"}, "outgoing": {"type": "array", "items": {"type": "object", "properties": {}, "additionalProperties": true}}, "incoming": {"type": "array", "items": {"type": "object", "properties": {}, "additionalProperties": true}}, "meta": {"type": "object", "properties": {}, "additionalProperties": true}}, "required": ["ok", "doc_id"], "additionalProperties": true},
+      "CommonsCandidate": {"type": "object", "properties": {"title": {"type": "string"}, "image_url": {"type": "string"}, "description_url": {"type": "string"}, "mime": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "author": {"type": "string"}, "license_short_name": {"type": "string"}, "license_url": {"type": "string"}, "credit": {"type": "string"}, "attribution_required": {"type": "string"}, "restrictions": {"type": "string"}, "relevance_score": {"type": "number"}}, "additionalProperties": true},
+      "CommonsResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "query": {"type": "string"}, "source": {"type": "string"}, "result_count": {"type": "integer"}, "results": {"type": "array", "items": {"$ref": "#/components/schemas/CommonsCandidate"}}, "status": {"type": "string"}, "note": {"type": "string"}, "diagnostics": {"type": "array", "items": {"type": "string"}}}, "required": ["ok", "results"], "additionalProperties": true},
+      "Project": {"type": "object", "properties": {"project_id": {"type": "string"}, "name": {"type": "string"}, "project_type": {"type": "string"}, "target_platform": {"type": ["string", "null"]}, "canon_scope": {"type": ["string", "null"]}, "stage": {"type": "string"}, "state": {"type": "object", "properties": {}, "additionalProperties": true}, "expires_at": {"type": ["string", "null"]}, "created_at": {"type": "string"}, "updated_at": {"type": "string"}, "events": {"type": "array", "items": {"type": "object", "properties": {}, "additionalProperties": true}}}, "required": ["project_id", "name", "stage", "state"], "additionalProperties": true},
+      "ProjectCreateResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "project": {"$ref": "#/components/schemas/Project"}, "project_access_token": {"type": "string", "description": "Return once; required for later project actions."}, "expires_at": {"type": "string"}, "access_note": {"type": "string"}}, "required": ["ok", "project", "project_access_token", "expires_at"], "additionalProperties": true},
+      "ProjectResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "project": {"$ref": "#/components/schemas/Project"}}, "required": ["ok", "project"], "additionalProperties": true},
+      "ProjectResearchResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "project_id": {"type": "string"}, "research": {"type": "object", "properties": {"query": {"type": "string"}, "indexed_matches": {"type": "array", "items": {"type": "object", "properties": {}, "additionalProperties": true}}, "method": {"type": "string"}}, "additionalProperties": true}, "note": {"type": "string"}}, "required": ["ok", "project_id", "research"], "additionalProperties": true},
+      "ProjectChecklistResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "project_id": {"type": "string"}, "stage": {"type": "string"}, "checks": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "passed": {"type": "boolean"}}, "additionalProperties": true}}, "passed": {"type": "integer"}, "total": {"type": "integer"}}, "required": ["ok", "project_id", "checks"], "additionalProperties": true},
+      "ProjectDeleteResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "project_id": {"type": "string"}, "deleted": {"type": "boolean"}}, "required": ["ok", "project_id", "deleted"], "additionalProperties": true},
+      "DiscoveryResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "seed_url": {"type": "string"}, "seed_platform": {"type": "string"}, "candidate_count": {"type": "integer"}, "candidates": {"type": "array", "items": {"type": "object", "properties": {"candidate_id": {"type": "string"}, "host": {"type": "string"}, "platform": {"type": "string"}, "status": {"type": "string"}, "score": {"type": "number"}}, "additionalProperties": true}}, "max_links": {"type": "integer"}, "diagnostics": {"type": "array", "items": {"type": "object", "properties": {}, "additionalProperties": true}}, "security_boundary": {"type": "string"}}, "required": ["ok", "candidates"], "additionalProperties": true},
+      "CandidateProbeResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "candidate_id": {"type": "string"}, "host": {"type": "string"}, "platform": {"type": "string"}, "status": {"type": "string"}, "reachable": {"type": "boolean"}, "url": {"type": "string"}, "http_status": {"type": "integer"}, "diagnostics": {"type": "array", "items": {"type": "object", "properties": {}, "additionalProperties": true}}, "note": {"type": "string"}}, "required": ["ok", "candidate_id", "host", "reachable"], "additionalProperties": true},
+      "EvalResponse": {"type": "object", "properties": {"ok": {"type": "boolean"}, "run_id": {"type": "string"}, "passed": {"type": "integer"}, "failed": {"type": "integer"}, "results": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "passed": {"type": "boolean"}, "details": {"type": ["string", "object"]}}, "additionalProperties": true}}}, "required": ["ok", "run_id", "passed", "failed", "results"], "additionalProperties": true},
+      "IngestRequest": {"type": "object", "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 500}, "scope": {"type": "string", "enum": ["core", "international", "extended", "all"], "default": "core"}, "source_ids": {"type": ["array", "null"], "maxItems": 12, "items": {"type": "string", "minLength": 1, "maxLength": 120}}, "allow_archive_fallback": {"type": "boolean", "default": false, "description": "False by default. Enable only when the user explicitly wants clearly labeled historical archive material indexed."}}, "required": ["query"], "additionalProperties": false},
+      "SyncRecentRequest": {"type": "object", "properties": {"scope": {"type": "string", "enum": ["core", "international", "extended", "all"], "default": "core"}, "per_source_limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5}, "total_limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 25}}, "additionalProperties": false},
+      "DiscoveryRequest": {"type": "object", "properties": {"url": {"type": "string", "format": "uri", "minLength": 8, "maxLength": 2048}, "max_links": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}}, "required": ["url"], "additionalProperties": false},
+      "EvalRequest": {"type": "object", "properties": {"live": {"type": "boolean", "default": true}}, "additionalProperties": false},
+      "ProjectCreateRequest": {"type": "object", "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 120}, "project_type": {"type": "string", "minLength": 1, "maxLength": 60, "default": "level"}, "target_platform": {"type": ["string", "null"], "maxLength": 80}, "canon_scope": {"type": ["string", "null"], "maxLength": 120}, "brief": {"type": "string", "maxLength": 8000, "default": ""}}, "required": ["name"], "additionalProperties": false},
+      "ProjectCapabilityRequest": {"type": "object", "properties": {"project_access_token": {"type": "string", "minLength": 32, "maxLength": 256}}, "required": ["project_access_token"], "additionalProperties": false},
+      "ProjectUpdateRequest": {"type": "object", "properties": {"project_access_token": {"type": "string", "minLength": 32, "maxLength": 256}, "patch": {"type": "object", "properties": {}, "additionalProperties": true, "description": "Project-state changes, maximum 32 KiB serialized."}, "stage": {"type": ["string", "null"], "enum": ["concept", "overlap_research", "rules", "environment", "narrative", "outline", "draft", "critique", "revision", "visuals", "technical", "publication_check", null]}}, "required": ["project_access_token"], "additionalProperties": false},
+      "ProjectOverlapRequest": {"type": "object", "properties": {"project_access_token": {"type": "string", "minLength": 32, "maxLength": 256}, "query": {"type": "string", "minLength": 1, "maxLength": 500}, "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 12}}, "required": ["project_access_token", "query"], "additionalProperties": false}
+    }
+  }
+}

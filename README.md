@@ -1,25 +1,19 @@
-# BackroomsGPT v21 Acceptance Hotfix
+# BackroomsGPT v21 Wikidot Full-URL Hotfix
 
-This hotfix addresses the concrete issues found by the final acceptance run:
-
-1. The omni resolver can no longer promote a fuzzy candidate such as
-   `Baby Partygoers` for the query `Baby Food`.
-2. Atlas graph extraction filters image/file links and generic false-positive
-   signals such as `Level is`, `Level whose`, and `Entity count`.
-3. Wikimedia Commons no longer overrides the gateway's safe
-   `Accept-Encoding: identity` policy with gzip. It also retries conservatively,
-   handles API errors, and keeps image-only relevance filtering.
-4. Offline regression tests cover all three changes.
-
-Files to replace/add:
+Replace/add exactly:
 
 - atlas/__init__.py
-- atlas/indexer.py
-- atlas/media.py
-- TESTS/test_v21_acceptance_hotfix.py
+- TESTS/test_v21_wikidot_full_url.py
 
-No secret, Render setting, OpenAPI schema, or GPT Knowledge change is included.
+The fix:
+- preserves the existing resolver identity guard;
+- accepts full Wikidot URLs only when the hostname exactly matches the requested registered source;
+- extracts and decodes the source-relative path before the existing slug matrix;
+- leaves title and slug behavior unchanged;
+- preserves namespace paths such as system: and component:;
+- rejects cross-source hosts before any network request;
+- does not change version, build, schema, Actions, Atlas, Commons, Liminal behavior, or Writer Projects.
 
-The GitHub connector in this chat returned HTTP 403 for repository write
-operations, so these files were prepared as a ready-to-apply replacement
-package rather than falsely claiming the repository was updated.
+The GitHub connector in this chat returned HTTP 403 for both Contents API writes
+and Git Data blob creation, so the repository itself could not be changed from
+the connector. This package is the exact minimal replacement hotfix.
